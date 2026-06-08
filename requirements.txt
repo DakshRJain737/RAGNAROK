@@ -34,7 +34,7 @@ torch==2.5.1
 transformers==4.57.6
 
 # Tokenizers — required by transformers. Exact pin prevents ABI mismatches.
-tokenizers==0.21.1
+tokenizers==0.22.0
 
 # ── Vector Search ─────────────────────────────────────────────────────────────
 
