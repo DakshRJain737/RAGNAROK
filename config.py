@@ -259,11 +259,6 @@ UNCERTAINTY_PENALTY_FLOOR: float = 0.70
 # ─────────────────────────────────────────────────────────────────────────────
 # Pre-compute flags these candidates offline. Zero cost at ranking time.
 
-# Rule 1: Experience at company exceeds company's plausible founding delta.
-# If career_history shows N months at a company but start_date predates
-# any reasonable founding, flag. We use a conservative 6-month buffer.
-HONEYPOT_FOUNDING_BUFFER_MONTHS: int = 6
-
 # Rule 2: Expert proficiency on a skill with 0 duration_months.
 # Schema allows duration_months to be 0 — honeypots abuse this.
 HONEYPOT_EXPERT_MIN_DURATION_MONTHS: int = 1  # expert needs at least 1 month

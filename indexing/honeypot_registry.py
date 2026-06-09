@@ -2,13 +2,6 @@ from pipeline.schemas import CandidateFeatureVector
 import config
 
 class HoneypotFilter:
-
-    # 1. Exp at company > founding delta
-    # Rule 1: Experience at company exceeds company's plausible founding delta.
-    # If career_history shows N months at a company but start_date predates
-    # any reasonable founding, flag. We use a conservative 6-month buffer.
-    def filter1(candidates : CandidateFeatureVector) -> bool:
-        pass
     
     # 2. expert proficiency + 0 months duration
     @staticmethod
