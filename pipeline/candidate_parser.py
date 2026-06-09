@@ -9,6 +9,7 @@ from .schemas import (
     RedrobSignals,
 )
 import config
+from indexing.honeypot_registry import HoneypotFilter 
 
 def parse_candidate(item):
 
@@ -138,8 +139,14 @@ for c in candidates:
     else:
         count += 1
 
-
 print(count) # count = 44 out of 50
 
+count = 0
+HoneypotFilter.run_honeypot_filters(candidates)
+for c in candidates:
+    if c.is_honeypot:
+        count += 1
+
+print(count) # count = 22 out of 50 i.e 22 honeypot candidates detected
 
 # ------- Test End--------

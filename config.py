@@ -274,7 +274,7 @@ HONEYPOT_EXPERT_MIN_DURATION_MONTHS: int = 1  # expert needs at least 1 month
 
 # Rule 4: Profile completeness score < threshold with suspiciously many skills.
 # Honeypots stuff the skills section but leave the profile empty.
-HONEYPOT_COMPLETENESS_THRESHOLD: float = 30.0
+HONEYPOT_COMPLETENESS_THRESHOLD: float = 35.0
 HONEYPOT_SKILLS_STUFFING_COUNT: int = 15
 
 # Rule 5: Years of experience wildly inconsistent with career history span.
