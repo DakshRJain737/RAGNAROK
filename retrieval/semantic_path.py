@@ -1,0 +1,658 @@
+"""
+retrieval/semantic_path.py
+--------------------------
+Retrieval Path 1: FAISS dense cosine-similarity search.
+
+Queries the pre-built FAISS IVF256 index with the JD's MiniLM embedding
+and returns the top-K most semantically similar candidates.
+
+Algorithm:
+    1. Encode JD text → 384-dim L2-normalised vector  [done in jd_parser.py]
+    2. Load IVF256 FAISS index from disk  (built offline by indexing/faiss_builder.py)
+    3. faiss.index.search(jd_vector, top_k) → (distances, internal_indices)
+    4. Map internal_indices → candidate_ids via pre-loaded numpy id-map
+    5. Wrap results as RetrievalResult(path_name="semantic")
+
+Why FAISS / dense retrieval?
+    Captures semantic matches that keyword overlap misses. A candidate who
+    says "built product ranking systems using bi-encoders and ANN indexes"
+    scores high even if the exact words "FAISS" or "Pinecone" are absent —
+    because the MiniLM embedding space clusters semantically similar text.
+
+Pre-requisites (produced by DEV B's indexing/faiss_builder.py):
+    data/indexes/faiss.index          — FAISS binary index (IVF256 or Flat)
+    data/indexes/candidate_ids.npy    — string array mapping FAISS row index
+                                        → CAND_XXXXXXX (allow_pickle=False safe)
+
+Design for testability without DEV B's files:
+    SemanticPath accepts pre-loaded `index` and `candidate_ids` objects so
+    unit tests can inject mock data without touching the filesystem.
+    Use SemanticPath.from_disk() in production / runner.py.
+
+Consumed by:
+    retrieval/rrf_fusion.py    (merges results from all 5 paths)
+    pipeline/runner.py         (Path 1 of the ranking pipeline)
+
+Dependencies:
+    config.py           FAISS_INDEX_PATH, FAISS_ID_MAP_PATH,
+                        SEMANTIC_PATH_TOP_K, FAISS_NPROBE, EMBEDDING_DIM
+    pipeline/schemas.py JDIntent, RetrievalResult
+    faiss-cpu           Optional import with clear error on missing
+    numpy               Always available (requirements.txt)
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+
+import config
+from pipeline.schemas import JDIntent, RetrievalResult
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Optional FAISS import — raises clear error at retrieve() time, not at import
+# ─────────────────────────────────────────────────────────────────────────────
+
+try:
+    import faiss as _faiss          # type: ignore[import]
+    _FAISS_AVAILABLE = True
+    logger.debug("faiss-cpu imported successfully.")
+except ImportError:
+    _faiss = None                   # type: ignore[assignment]
+    _FAISS_AVAILABLE = False
+    logger.warning(
+        "faiss-cpu is not installed. SemanticPath.retrieve() will raise "
+        "RuntimeError. Install with: pip install faiss-cpu==1.8.0"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SemanticPath
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SemanticPath:
+    """
+    FAISS dense cosine-similarity retrieval path (Path 1 of 5).
+
+    Typical production usage:
+        # Load once in runner.py at startup
+        path = SemanticPath.from_disk()
+
+        # Call once per JD inside the ranking loop
+        results = path.retrieve(jd_intent, top_k=25)
+
+    Unit-test usage (no real index needed):
+        import faiss, numpy as np
+        dim = 384
+        index = faiss.IndexFlatIP(dim)
+        # Add 10 mock vectors
+        vecs = np.random.randn(10, dim).astype("float32")
+        faiss.normalize_L2(vecs)
+        index.add(vecs)
+        ids = np.array([f"CAND_{i:07d}" for i in range(10)])
+        path = SemanticPath(index=index, candidate_ids=ids)
+        results = path.retrieve(jd_intent)
+    """
+
+    PATH_NAME: str = "semantic"
+
+    def __init__(
+        self,
+        index: Optional[Any] = None,
+        candidate_ids: Optional[np.ndarray] = None,
+        index_path: Optional[Path] = None,
+        id_map_path: Optional[Path] = None,
+    ) -> None:
+        """
+        Initialise with either pre-loaded objects (for testing) or file paths
+        (for production). Mixing is allowed — e.g. pre-loaded index + default
+        id_map path.
+
+        At least one of (index, index_path) must be resolvable. If both are
+        supplied, the pre-loaded `index` takes priority (no I/O performed).
+
+        Args:
+            index:         Pre-loaded faiss.Index object. Any FAISS index type
+                           works (IVF, Flat, HNSW, IDMap, …).
+            candidate_ids: 1-D numpy string array of length N mapping FAISS
+                           internal row index → CAND_XXXXXXX.
+            index_path:    Path to FAISS binary file (default:
+                           config.FAISS_INDEX_PATH).
+            id_map_path:   Path to candidate_ids .npy file (default:
+                           config.FAISS_ID_MAP_PATH).
+
+        Raises:
+            FileNotFoundError: A required file path does not exist.
+            ValueError:        candidate_ids length does not match index size.
+        """
+        self._index_path: Path = index_path or config.FAISS_INDEX_PATH
+        self._id_map_path: Path = id_map_path or config.FAISS_ID_MAP_PATH
+
+        if index is not None:
+            # Pre-loaded objects supplied — use directly (test / hot-reload path)
+            self._index = index
+            self._candidate_ids: np.ndarray = (
+                candidate_ids if candidate_ids is not None
+                else self._load_id_map(self._id_map_path)
+            )
+            self._configure_nprobe()
+            self._validate_index_id_alignment()
+            logger.debug(
+                "SemanticPath initialised with pre-loaded index "
+                "(ntotal=%d, ids=%d).",
+                self._index.ntotal,
+                len(self._candidate_ids),
+            )
+        else:
+            # Defer I/O to _ensure_loaded() — caller must call from_disk()
+            # or retrieve() will trigger lazy load.
+            self._index = None
+            self._candidate_ids = np.empty(0, dtype=object)
+            self._loaded: bool = False
+
+        self._loaded: bool = index is not None
+
+    # ------------------------------------------------------------------ #
+    # Factory — production path                                           #
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def from_disk(
+        cls,
+        index_path: Optional[Path] = None,
+        id_map_path: Optional[Path] = None,
+    ) -> "SemanticPath":
+        """
+        Load FAISS index and candidate ID map from disk.
+
+        Call once in pipeline/runner.py at startup; reuse the returned
+        instance across all retrieve() calls to avoid repeated I/O.
+
+        Args:
+            index_path:  Override for config.FAISS_INDEX_PATH.
+            id_map_path: Override for config.FAISS_ID_MAP_PATH.
+
+        Returns:
+            Fully loaded SemanticPath instance, ready for retrieve().
+
+        Raises:
+            RuntimeError:      faiss-cpu not installed.
+            FileNotFoundError: Index or ID map file not found.
+            ValueError:        Index size / ID map mismatch.
+        """
+        instance = cls(index_path=index_path, id_map_path=id_map_path)
+        instance._ensure_loaded()
+        return instance
+
+    # ------------------------------------------------------------------ #
+    # Primary retrieve method                                              #
+    # ------------------------------------------------------------------ #
+
+    def retrieve(
+        self,
+        jd_intent: JDIntent,
+        top_k: int = config.SEMANTIC_PATH_TOP_K,
+    ) -> list[RetrievalResult]:
+        """
+        Query the FAISS index with the JD embedding vector.
+
+        Args:
+            jd_intent: Parsed JD intent. jd_intent.embedding MUST be
+                       populated (encode=True in JDParser.parse()).
+            top_k:     Number of candidates to retrieve. Defaults to
+                       config.SEMANTIC_PATH_TOP_K (25).
+
+        Returns:
+            List of RetrievalResult, sorted by cosine similarity descending,
+            length = min(top_k, index.ntotal).
+
+            path_name  = "semantic"
+            path_score = cosine similarity ∈ [0.0, 1.0]  (clipped at 0)
+            rank_in_path = 1-indexed position in this path's results
+
+        Raises:
+            RuntimeError:  faiss-cpu not installed.
+            ValueError:    jd_intent.embedding is None (JD was not encoded).
+            RuntimeError:  Index not loaded (call from_disk() first or pass
+                           index= to constructor).
+        """
+        self._assert_faiss_available()
+        self._ensure_loaded()
+        self._assert_embedding_present(jd_intent)
+
+        if top_k < 1:
+            raise ValueError(f"top_k must be >= 1, got {top_k}")
+
+        # ── Build query vector ────────────────────────────────────────────
+        query_vec = np.array(
+            jd_intent.embedding, dtype=np.float32
+        ).reshape(1, -1)
+
+        # Ensure the query is L2-normalised (it should already be from
+        # JDParser._encode, but we re-normalise defensively).
+        _faiss.normalize_L2(query_vec)
+
+        # Clamp top_k to index size to avoid FAISS returning -1 padding
+        effective_top_k = min(top_k, self._index.ntotal)
+        if effective_top_k < top_k:
+            logger.debug(
+                "top_k clamped from %d to %d (index only has %d candidates).",
+                top_k, effective_top_k, self._index.ntotal,
+            )
+
+        # ── FAISS search ──────────────────────────────────────────────────
+        t0 = time.perf_counter()
+        distances, indices = self._index.search(query_vec, effective_top_k)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        logger.debug(
+            "FAISS search: top_k=%d, ntotal=%d, elapsed=%.1f ms",
+            effective_top_k,
+            self._index.ntotal,
+            elapsed_ms,
+        )
+
+        if elapsed_ms > 50.0:
+            logger.warning(
+                "FAISS search took %.1f ms (> 50 ms budget). "
+                "Check nprobe setting or index type.",
+                elapsed_ms,
+            )
+
+        # ── Map FAISS rows → candidate_ids ────────────────────────────────
+        raw_indices: np.ndarray = indices[0]   # shape (effective_top_k,)
+        raw_scores: np.ndarray = distances[0]  # shape (effective_top_k,)
+
+        results: list[RetrievalResult] = []
+        rank = 0
+
+        for faiss_idx, raw_score in zip(raw_indices, raw_scores):
+            # FAISS uses -1 to pad when index has fewer candidates than top_k
+            if faiss_idx < 0:
+                continue
+
+            if faiss_idx >= len(self._candidate_ids):
+                logger.warning(
+                    "FAISS returned out-of-range index %d "
+                    "(candidate_ids length=%d). Skipping.",
+                    faiss_idx,
+                    len(self._candidate_ids),
+                )
+                continue
+
+            candidate_id: str = str(self._candidate_ids[faiss_idx])
+            # Cosine similarity for L2-normalised vectors ∈ [-1, 1].
+            # Clip to [0, 1] — negative similarity means anti-similar, not relevant.
+            score: float = float(max(0.0, raw_score))
+            rank += 1
+
+            results.append(
+                RetrievalResult(
+                    candidate_id=candidate_id,
+                    path_score=score,
+                    path_name=self.PATH_NAME,
+                    rank_in_path=rank,
+                )
+            )
+
+        logger.info(
+            "SemanticPath.retrieve: top_k=%d → %d results  (%.1f ms)",
+            top_k,
+            len(results),
+            elapsed_ms,
+        )
+        return results
+
+    # ------------------------------------------------------------------ #
+    # Internal loading                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _ensure_loaded(self) -> None:
+        """Load index and ID map from disk if not already loaded."""
+        if self._loaded:
+            return
+
+        self._assert_faiss_available()
+
+        self._index = self._load_faiss_index(self._index_path)
+        self._candidate_ids = self._load_id_map(self._id_map_path)
+        self._configure_nprobe()
+        self._validate_index_id_alignment()
+        self._loaded = True
+
+        logger.info(
+            "SemanticPath loaded from disk: "
+            "ntotal=%d, id_map=%d, nprobe=%s",
+            self._index.ntotal,
+            len(self._candidate_ids),
+            getattr(self._index, "nprobe", "N/A (Flat)"),
+        )
+
+    @staticmethod
+    def _load_faiss_index(path: Path) -> Any:
+        """
+        Load a FAISS index from a binary file.
+
+        Raises:
+            FileNotFoundError: File not found at path.
+            RuntimeError:      FAISS failed to read the file.
+        """
+        if not path.exists():
+            raise FileNotFoundError(
+                f"FAISS index not found: '{path}'. "
+                "Run precompute.py to build the index, or verify "
+                "config.FAISS_INDEX_PATH."
+            )
+        t0 = time.perf_counter()
+        try:
+            index = _faiss.read_index(str(path))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to read FAISS index from '{path}': {exc}"
+            ) from exc
+
+        elapsed = (time.perf_counter() - t0) * 1000.0
+        logger.debug("FAISS index loaded in %.0f ms (ntotal=%d).", elapsed, index.ntotal)
+        return index
+
+    @staticmethod
+    def _load_id_map(path: Path) -> np.ndarray:
+        """
+        Load the candidate_ids numpy array.
+
+        The array must be a 1-D array of strings (dtype=object) where
+        id_map[i] = the candidate_id for FAISS internal index i.
+
+        allow_pickle=False prevents arbitrary code execution from a tampered
+        .npy file. String arrays are stored as object dtype which technically
+        requires allow_pickle=True. We use allow_pickle=True but validate the
+        content immediately after load.
+
+        Raises:
+            FileNotFoundError: File not found at path.
+            ValueError:        Array is not 1-D or contains non-string elements.
+        """
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Candidate ID map not found: '{path}'. "
+                "Run precompute.py to build the indexes, or verify "
+                "config.FAISS_ID_MAP_PATH."
+            )
+        try:
+            # allow_pickle=True required for object-dtype (string) arrays.
+            # We immediately validate content to mitigate injection risk.
+            arr: np.ndarray = np.load(str(path), allow_pickle=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load candidate_ids from '{path}': {exc}"
+            ) from exc
+
+        if arr.ndim != 1:
+            raise ValueError(
+                f"candidate_ids array must be 1-D, got shape {arr.shape}."
+            )
+
+        # Validate that all entries look like CAND_XXXXXXX
+        import re as _re
+        _cand_re = _re.compile(r"^CAND_[0-9]{7}$")
+        sample_size = min(10, len(arr))
+        for entry in arr[:sample_size]:
+            entry_str = str(entry)
+            if not _cand_re.match(entry_str):
+                raise ValueError(
+                    f"Unexpected candidate_id format in id_map: '{entry_str}'. "
+                    "Expected CAND_XXXXXXX. Check faiss_builder.py output."
+                )
+
+        logger.debug("candidate_ids loaded: %d entries.", len(arr))
+        return arr
+
+    def _configure_nprobe(self) -> None:
+        """
+        Set nprobe on IVF indexes for approximate search speed/recall tradeoff.
+
+        nprobe = number of Voronoi cells to search. Higher = better recall,
+        slower query. config.FAISS_NPROBE=32 out of FAISS_NLIST=256 cells
+        gives ~80% recall with ~8x speedup over exhaustive search.
+
+        No-op for Flat indexes (they perform exact search regardless).
+        """
+        if self._index is not None and hasattr(self._index, "nprobe"):
+            self._index.nprobe = config.FAISS_NPROBE
+            logger.debug("FAISS nprobe set to %d.", config.FAISS_NPROBE)
+
+    def _validate_index_id_alignment(self) -> None:
+        """
+        Verify that the FAISS index and candidate_ids array are aligned.
+
+        Raises:
+            ValueError: ntotal != len(candidate_ids).
+        """
+        if self._index is None or len(self._candidate_ids) == 0:
+            return
+        if self._index.ntotal != len(self._candidate_ids):
+            raise ValueError(
+                f"FAISS index ntotal={self._index.ntotal} does not match "
+                f"candidate_ids length={len(self._candidate_ids)}. "
+                "Re-run precompute.py to rebuild aligned indexes."
+            )
+
+    # ------------------------------------------------------------------ #
+    # Assertion helpers                                                    #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _assert_faiss_available() -> None:
+        if not _FAISS_AVAILABLE:
+            raise RuntimeError(
+                "faiss-cpu is not installed. "
+                "Run: pip install faiss-cpu==1.8.0"
+            )
+
+    @staticmethod
+    def _assert_embedding_present(jd_intent: JDIntent) -> None:
+        if jd_intent.embedding is None:
+            raise ValueError(
+                "jd_intent.embedding is None. "
+                "Parse the JD with encode=True: "
+                "JDParser().parse(jd_text, encode=True). "
+                "The FAISS semantic path requires a pre-computed embedding."
+            )
+        if len(jd_intent.embedding) != config.EMBEDDING_DIM:
+            raise ValueError(
+                f"jd_intent.embedding has {len(jd_intent.embedding)} dimensions "
+                f"but expected {config.EMBEDDING_DIM}. "
+                "Ensure the JD was encoded with the same model as the FAISS index "
+                f"({config.BI_ENCODER_MODEL})."
+            )
+
+    # ------------------------------------------------------------------ #
+    # Properties                                                           #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def loaded(self) -> bool:
+        """True if the FAISS index and ID map are ready for queries."""
+        return self._loaded
+
+    @property
+    def ntotal(self) -> int:
+        """Number of candidates in the FAISS index (0 if not loaded)."""
+        if not self._loaded or self._index is None:
+            return 0
+        return int(self._index.ntotal)
+
+    def __repr__(self) -> str:
+        status = (
+            f"ntotal={self.ntotal}, "
+            f"nprobe={getattr(self._index, 'nprobe', 'N/A')}"
+            if self._loaded else "not loaded"
+        )
+        return f"SemanticPath({status})"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level convenience
+# ─────────────────────────────────────────────────────────────────────────────
+
+def retrieve_semantic(
+    jd_intent: JDIntent,
+    top_k: int = config.SEMANTIC_PATH_TOP_K,
+    index_path: Optional[Path] = None,
+    id_map_path: Optional[Path] = None,
+) -> list[RetrievalResult]:
+    """
+    One-shot convenience: load FAISS index and retrieve top-K candidates.
+
+    Creates a new SemanticPath on each call (incurs disk I/O).
+    For repeated calls (e.g. in runner.py), use SemanticPath.from_disk()
+    once and reuse the instance.
+
+    Args:
+        jd_intent:   Fully parsed JDIntent with embedding populated.
+        top_k:       Number of results to return.
+        index_path:  Override for config.FAISS_INDEX_PATH.
+        id_map_path: Override for config.FAISS_ID_MAP_PATH.
+
+    Returns:
+        list[RetrievalResult] sorted by cosine similarity descending.
+    """
+    path = SemanticPath.from_disk(index_path=index_path, id_map_path=id_map_path)
+    return path.retrieve(jd_intent, top_k=top_k)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Smoke test — python -m retrieval.semantic_path
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+    import random
+
+    logging.basicConfig(level=logging.DEBUG, format=config.LOG_FORMAT)
+
+    print("=" * 65)
+    print("SemanticPath — smoke test with synthetic in-memory index")
+    print("=" * 65)
+
+    if not _FAISS_AVAILABLE:
+        print("[SKIP] faiss-cpu not installed. Cannot run smoke test.")
+        sys.exit(0)
+
+    # ── Build a synthetic 50-candidate FAISS index in memory ─────────────
+    N_CANDIDATES = 50
+    DIM = config.EMBEDDING_DIM
+    TOP_K = config.SEMANTIC_PATH_TOP_K
+
+    rng = np.random.default_rng(seed=42)
+    raw_vecs = rng.standard_normal((N_CANDIDATES, DIM)).astype(np.float32)
+    _faiss.normalize_L2(raw_vecs)
+
+    index = _faiss.IndexFlatIP(DIM)
+    index.add(raw_vecs)
+
+    synthetic_ids = np.array(
+        [f"CAND_{i:07d}" for i in range(1, N_CANDIDATES + 1)],
+        dtype=object,
+    )
+
+    path_obj = SemanticPath(index=index, candidate_ids=synthetic_ids)
+    print(f"\nBuilt:  {path_obj}")
+
+    # ── Build a mock JDIntent with a synthetic embedding ─────────────────
+    from pipeline.schemas import JDIntent  # noqa: PLC0415
+
+    jd_query = rng.standard_normal(DIM).astype(np.float32)
+    jd_query /= np.linalg.norm(jd_query)  # L2-normalise
+
+    mock_intent = JDIntent(
+        required_skills=["embeddings", "faiss"],
+        nice_to_have_skills=[],
+        disqualifier_skills=[],
+        expanded_required=["embeddings", "faiss"],
+        yoe_min=4.0,
+        yoe_max=12.0,
+        yoe_ideal_min=5.0,
+        yoe_ideal_max=9.0,
+        preferred_locations=["noida", "pune"],
+        relocation_accepted=True,
+        disqualify_consulting_only=True,
+        disqualify_no_production=True,
+        embedding=jd_query.tolist(),
+        raw_text="Senior AI Engineer. Requires embeddings, FAISS, ranking.",
+    )
+
+    # ── Run retrieve() ────────────────────────────────────────────────────
+    t0 = time.perf_counter()
+    results = path_obj.retrieve(mock_intent, top_k=TOP_K)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    print(f"\nRetrieved {len(results)} results in {elapsed_ms:.2f} ms")
+    for r in results[:5]:
+        print(f"  rank={r.rank_in_path:>2}  {r.candidate_id}  score={r.path_score:.4f}")
+
+    # ── Sprint acceptance criterion 1: returns ≤ top_k results ───────────
+    assert len(results) <= TOP_K, (
+        f"FAIL: got {len(results)} results, expected <= {TOP_K}"
+    )
+    print(f"\n[PASS] len(results) <= {TOP_K}  ✓")
+
+    # ── Sprint acceptance criterion 2: sorted descending ─────────────────
+    for i in range(len(results) - 1):
+        assert results[i].path_score >= results[i + 1].path_score, (
+            f"FAIL: results not sorted descending at index {i}"
+        )
+    print("[PASS] Results sorted by cosine similarity descending  ✓")
+
+    # ── Sprint acceptance criterion 3: all path_name == "semantic" ────────
+    assert all(r.path_name == SemanticPath.PATH_NAME for r in results), (
+        "FAIL: unexpected path_name in results"
+    )
+    print("[PASS] All results have path_name='semantic'  ✓")
+
+    # ── Sprint acceptance criterion 4: ranks are 1-indexed, sequential ────
+    assert [r.rank_in_path for r in results] == list(range(1, len(results) + 1)), (
+        "FAIL: rank_in_path values are not 1-indexed sequential"
+    )
+    print("[PASS] rank_in_path is 1-indexed sequential  ✓")
+
+    # ── Sprint acceptance criterion 5: scores in [0, 1] ──────────────────
+    assert all(0.0 <= r.path_score <= 1.0 for r in results), (
+        f"FAIL: path_score out of [0,1] range: "
+        f"{[r.path_score for r in results if not 0 <= r.path_score <= 1]}"
+    )
+    print("[PASS] All path_scores in [0.0, 1.0]  ✓")
+
+    # ── Sprint acceptance criterion 6: valid candidate_id format ──────────
+    import re
+    _cand_re = re.compile(r"^CAND_[0-9]{7}$")
+    for r in results:
+        assert _cand_re.match(r.candidate_id), (
+            f"FAIL: invalid candidate_id format: '{r.candidate_id}'"
+        )
+    print("[PASS] All candidate_ids match CAND_XXXXXXX format  ✓")
+
+    # ── Error path: None embedding ────────────────────────────────────────
+    mock_no_embed = JDIntent(
+        required_skills=[], nice_to_have_skills=[], disqualifier_skills=[],
+        expanded_required=[], yoe_min=0.0, yoe_max=50.0,
+        yoe_ideal_min=5.0, yoe_ideal_max=9.0,
+        preferred_locations=[], relocation_accepted=False,
+        disqualify_consulting_only=False, disqualify_no_production=False,
+        embedding=None, raw_text="",
+    )
+    try:
+        path_obj.retrieve(mock_no_embed)
+        print("FAIL: Expected ValueError for None embedding — not raised.")
+        sys.exit(1)
+    except ValueError as exc:
+        print(f"[PASS] ValueError raised for None embedding: '{exc}'  ✓")
+
+    print("\nAll smoke-test assertions passed.")
+#---Test End--->
