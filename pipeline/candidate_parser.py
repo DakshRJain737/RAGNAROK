@@ -9,7 +9,8 @@ from .schemas import (
     RedrobSignals,
 )
 import config
-from indexing.honeypot_registry import HoneypotFilter 
+from indexing.honeypot_registry import HoneypotFilter
+from indexing.trajectory_builder import TrajectoryAnalyzer
 import time
 
 def parse_candidate(item):
@@ -153,6 +154,37 @@ for c in candidates:
 
 print(count) # count = 22 out of 50 i.e 22 honeypot candidates detected
 
+for c in candidates:
+    traj = TrajectoryAnalyzer.build_feature_vector(c)
+    
+    stability_score = min(
+        traj["avg_tenure"] / 3.0,
+        1.0
+    )
+
+    career_score = (
+        0.40 * traj["yoe_score"]
+        + 0.30 * traj["product_experience"]
+        + 0.30 * stability_score
+    )
+
+    if traj["consulting_only"] == 1.0:
+        career_score *= config.CONSULTING_ONLY_PENALTY
+        
+    print("=" * 50)
+    print(c.candidate_id)
+
+    print("YOE:", c.years_of_experience)
+    print("YOE Score:", traj["yoe_score"])
+
+    print("Avg Tenure:", traj["avg_tenure"])
+    print("Job Hopper:", traj["job_hopper"])
+
+    print("Consulting Only:", traj["consulting_only"])
+
+    print("Product Experience:", traj["product_experience"])
+
+    print("Career Score:", career_score)
 
 
 time2 = time.perf_counter()
