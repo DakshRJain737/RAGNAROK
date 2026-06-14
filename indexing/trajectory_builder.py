@@ -1,5 +1,3 @@
-# trajectory_analyzer.py
-
 import config
 from pipeline.schemas import CandidateFeatureVector
 
@@ -7,152 +5,94 @@ from pipeline.schemas import CandidateFeatureVector
 class TrajectoryAnalyzer:
 
     # --------------------------------------------------
-    # TENURE
+    # TENURE (Pure Utility)
     # --------------------------------------------------
-
     @staticmethod
-    def average_tenure_years(candidate):
-
+    def calculate_tenure_metrics(candidate: CandidateFeatureVector) -> tuple[float, float, float]:
+        """
+        Calculates all tenure-related stats in a single pass to optimize CPU execution.
+        Returns: (avg_tenure, stability_score, job_hopper_flag)
+        """
         history = candidate.career_history
-
         if not history:
-            return 0.0
+            return 0.0, 0.0, 1.0  # No history means 0 tenure, 0 stability, is a job hopper
 
-        total_months = sum(
-            job.duration_months
-            for job in history
-        )
-
-        return (total_months / len(history)) / 12.0
+        total_months = sum(job.duration_months for job in history)
+        avg_tenure = (total_months / len(history)) / 12.0
+        
+        stability_score = min(avg_tenure / 3.0, 1.0)
+        is_job_hopper = float(avg_tenure < 1.5)
+        
+        return avg_tenure, stability_score, is_job_hopper
 
     # --------------------------------------------------
-    # STABILITY SCORE
+    # CONSULTING & PRODUCT EXPERIENCE (Combined Pass)
     # --------------------------------------------------
-
     @staticmethod
-    def stability_score(candidate):
+    def analyze_career_history(candidate: CandidateFeatureVector) -> tuple[float, float]:
+        """
+        Scans career history ONCE to determine both consulting and product tracks.
+        Returns: (consulting_only_flag, has_product_exp_flag)
+        """
+        history = candidate.career_history
+        if not history:
+            return 0.0, 0.0
 
-        tenure = (
-            TrajectoryAnalyzer.average_tenure_years(candidate)
-        )
+        has_companies = False
+        all_companies_are_consulting = True
+        has_product_experience = 0.0
 
-        return min(
-            tenure / 3.0,
-            1.0
-        )
+        # Pre-cache lowered configuration sets for instant O(1) lookups
+        consulting_firms = getattr(config, "_cached_consulting", None)
+        if consulting_firms is None:
+            config._cached_consulting = consulting_firms = {f.lower().strip() for f in config.CONSULTING_FIRMS}
+            
+        product_industries = getattr(config, "_cached_product", None)
+        if product_industries is None:
+            config._cached_product = product_industries = {i.lower().strip() for i in config.PRODUCT_INDUSTRIES}
 
-    # --------------------------------------------------
-    # JOB HOPPER
-    # --------------------------------------------------
+        for job in history:
+            # 1. Check Consulting status
+            if job.company:
+                has_companies = True
+                company_clean = job.company.lower().strip()
+                if company_clean not in consulting_firms:
+                    all_companies_are_consulting = False
 
-    @staticmethod
-    def is_job_hopper(candidate):
+            # 2. Check Product Experience status
+            if job.industry:
+                industry_clean = job.industry.lower().strip()
+                if industry_clean in product_industries:
+                    has_product_experience = 1.0
 
-        return (
-            TrajectoryAnalyzer.average_tenure_years(candidate)
-            < 1.5
-        )
-
-    # --------------------------------------------------
-    # CONSULTING ONLY
-    # --------------------------------------------------
-
-    @staticmethod
-    def is_consulting_only(candidate):
-
-        companies = []
-
-        for job in candidate.career_history:
-
-            if not job.company:
-                continue
-
-            companies.append(
-                job.company.lower().strip()
-            )
-
-        if not companies:
-            return False
-
-        return all(
-            company in config.CONSULTING_FIRMS
-            for company in companies
-        )
-
-    # --------------------------------------------------
-    # PRODUCT EXPERIENCE
-    # --------------------------------------------------
-
-    @staticmethod
-    def has_product_experience(candidate):
-
-        for job in candidate.career_history:
-
-            industry = (
-                job.industry.lower().strip()
-                if job.industry
-                else ""
-            )
-
-            if industry in config.PRODUCT_INDUSTRIES:
-                return True
-
-        return False
+        is_consulting_only = float(has_companies and all_companies_are_consulting)
+        return is_consulting_only, has_product_experience
 
     # --------------------------------------------------
     # YOE SCORE
     # --------------------------------------------------
-
     @staticmethod
-    def yoe_score(candidate):
-
+    def yoe_score(candidate: CandidateFeatureVector) -> float:
         yoe = candidate.years_of_experience
 
-        if (
-            config.YOE_BAND_IDEAL_MIN
-            <= yoe
-            <= config.YOE_BAND_IDEAL_MAX
-        ):
+        if config.YOE_BAND_IDEAL_MIN <= yoe <= config.YOE_BAND_IDEAL_MAX:
             return 1.0
 
         if yoe < config.YOE_BAND_IDEAL_MIN:
-
-            return max(
-                0.0,
-                (yoe / config.YOE_BAND_IDEAL_MIN)**2
-            )
+            return max(0.0, (yoe / config.YOE_BAND_IDEAL_MIN) ** 2)
 
         if yoe <= config.YOE_BAND_MAX:
-
-            excess = (
-                yoe
-                - config.YOE_BAND_IDEAL_MAX
-            )
-
-            width = (
-                config.YOE_BAND_MAX
-                - config.YOE_BAND_IDEAL_MAX
-            )
-
-            return max(
-                0.0,
-                1.0 - (excess / width)
-            )
+            excess = yoe - config.YOE_BAND_IDEAL_MAX
+            width = config.YOE_BAND_MAX - config.YOE_BAND_IDEAL_MAX
+            return max(0.0, 1.0 - (excess / width))
 
         return 0.25
 
     # --------------------------------------------------
     # CAREER SCORE
     # --------------------------------------------------
-
-    @staticmethod
-    def career_score(candidate):
-
-        traj = (
-            TrajectoryAnalyzer.build_feature_vector(
-                candidate
-            )
-        )
+    def career_score(self, candidate: CandidateFeatureVector) -> float:
+        traj = self.build_feature_vector(candidate)
 
         score = (
             0.40 * traj["yoe_score"]
@@ -165,48 +105,22 @@ class TrajectoryAnalyzer:
 
         return round(score, 4)
 
-    # --------------------------------------------------
+    # --------------------------------─
     # FEATURE VECTOR
-    # --------------------------------------------------
-
-    @staticmethod
-    def build_feature_vector(
-        candidate: CandidateFeatureVector
-    ):
+    # --------------------------------─
+    def build_feature_vector(self, candidate: CandidateFeatureVector) -> dict:
+        # Calculate structural metrics in combined efficient loops
+        avg_tenure, stability, job_hopper = self.calculate_tenure_metrics(candidate)
+        is_consulting, product_exp = self.analyze_career_history(candidate)
 
         return {
-
-            "yoe_score":
-                TrajectoryAnalyzer.yoe_score(candidate),
-
-            "avg_tenure":
-                TrajectoryAnalyzer.average_tenure_years(
-                    candidate
-                ),
-
-            "stability_score":
-                TrajectoryAnalyzer.stability_score(
-                    candidate
-                ),
-
-            "job_hopper":
-                float(
-                    TrajectoryAnalyzer.is_job_hopper(
-                        candidate
-                    )
-                ),
-
-            "consulting_only":
-                float(
-                    TrajectoryAnalyzer.is_consulting_only(
-                        candidate
-                    )
-                ),
-
-            "product_experience":
-                float(
-                    TrajectoryAnalyzer.has_product_experience(
-                        candidate
-                    )
-                ),
+            "yoe_score": self.yoe_score(candidate),
+            "avg_tenure": avg_tenure,
+            "stability_score": stability,
+            "job_hopper": job_hopper,
+            "consulting_only": is_consulting,
+            "product_experience": product_exp,
         }
+    
+    def build_all_feature_vector(self, candidates: list[CandidateFeatureVector]) -> list[dict]:
+        return [self.build_feature_vector(c) for c in candidates]
