@@ -1,156 +1,315 @@
-import collections
+from __future__ import annotations
+
 import re
-import math
 import json
+import math
+import pickle
+import logging
+import collections
+from pathlib import Path
+from typing import Optional
 
-# ---------------------------------------------------------
-# 1. DYNAMIC JSON GRAPH FLATTENING ENGINE
-# ---------------------------------------------------------
-def flatten_json_recursive(data, weight_map=None, current_path=""):
+import config
+from pipeline.schemas import CandidateFeatureVector
+
+logger = logging.getLogger(__name__)
+
+
+# ── Ontology loader ───────────────────────────────────────────────────────────
+
+def _load_ontology(path: Path) -> dict[str, list[str]]:
     """
-    Recursively traverses and flattens every single string element within the 
-    entire JSON structure. No keys are ignored or selectively skipped.
+    Load skill_map.json as a clean synonym map.
+
+    Expects the JSON to be structured as:
+        { "python": ["py", "python3"], "faiss": ["facebook ai similarity search"], ... }
+
+    If the file is missing or malformed, returns an empty dict (graceful degradation).
     """
-    if weight_map is None:
-        weight_map = collections.defaultdict(float)
-        
-    if isinstance(data, dict):
-        for key, value in data.items():
-            # Process string keys as query token hooks
-            normalized_key = key.lower().strip()
-            weight_map[normalized_key] += 1.0
-            
-            # Recursive dive into nested structures
-            flatten_json_recursive(value, weight_map, current_path=f"{current_path}.{key}")
-            
-    elif isinstance(data, list):
-        for item in data:
-            flatten_json_recursive(item, weight_map, current_path)
-            
-    elif isinstance(data, (str, int, float)):
-        # Normalize and track raw text property tokens safely
-        normalized_val = str(data).lower().strip()
-        weight_map[normalized_val] += 0.5  # Universal expansion token weight
-        
-    return weight_map
+    if not path.exists():
+        logger.warning("skill_map.json not found at '%s'. Ontology expansion disabled.", path)
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        # Only keep entries where value is a list of strings — skip malformed keys
+        ontology = {}
+        for key, val in raw.items():
+            if isinstance(val, list):
+                ontology[key.lower().strip()] = [
+                    v.lower().strip() for v in val if isinstance(v, str)
+                ]
+        logger.info("Loaded ontology: %d skill entries from '%s'", len(ontology), path)
+        return ontology
+    except Exception as e:
+        logger.warning("Failed to parse skill_map.json: %s. Ontology expansion disabled.", e)
+        return {}
 
-def load_and_map_full_ontology(file_path="skill_map.json"):
-    """Reads the entire schema without selective filtering blocks."""
-    with open(file_path, "r", encoding="utf-8") as f:
-        raw_json_data = json.load(f)
-    
-    # Flatten everything into a single operational mapping matrix
-    return flatten_json_recursive(raw_json_data)
 
-# Extract and instantiate the entire content matrix dynamically
-try:
-    FULL_ONTOLOGY_MATRIX = load_and_map_full_ontology("skill_map.json")
-except FileNotFoundError:
-    print("[WARNING] 'skill_map.json' missing. Using an empty matrix layer.")
-    FULL_ONTOLOGY_MATRIX = {}
+ONTOLOGY: dict[str, list[str]] = _load_ontology(config.SKILL_MAP_PATH)
 
-# ---------------------------------------------------------
-# 2. COMPLETE OKAPI BM25 INVERTED INDEX ENGINE
-# ---------------------------------------------------------
-class FullTextBM25Index:
-    """Okapi BM25 implementation handling token arrays seamlessly."""
-    def __init__(self, corpus, k1=1.5, b=0.75):
+
+# ── Text utilities ────────────────────────────────────────────────────────────
+
+def _tokenize(text: str) -> list[str]:
+    """
+    Lowercase and split on word boundaries.
+    Keeps alphanumeric tokens plus common tech punctuation (c++, .net, node.js).
+    """
+    if not text:
+        return []
+    return re.findall(r'\b[a-z0-9][a-z0-9\+\#\.]*\b', text.lower())
+
+
+def _expand_query(tokens: list[str]) -> list[str]:
+    """
+    Expand query tokens using the ontology synonym map.
+    Each original token keeps weight 1.0; synonyms are added once (no duplication).
+
+    e.g. ["faiss"] → ["faiss", "facebook ai similarity search", "vector index"]
+    """
+    expanded = list(tokens)  # start with originals
+    seen = set(tokens)
+
+    for token in tokens:
+        # Exact key match in ontology
+        if token in ONTOLOGY:
+            for synonym in ONTOLOGY[token]:
+                if synonym not in seen:
+                    expanded.append(synonym)
+                    seen.add(synonym)
+
+    return expanded
+
+
+def _build_candidate_text(c: CandidateFeatureVector) -> str:
+    """
+    Build a single text document per candidate for BM25 indexing.
+    Mirrors FaissIndex._build_embedding_text but optimised for keyword matching:
+    - Skills are repeated by proficiency weight so expert skills score higher
+    - Career titles and industries are emphasised
+    - No hard char limit (BM25 handles length via doc_len normalisation)
+    """
+    parts: list[str] = []
+
+    # Current role — high signal for title matching
+    parts.append(c.current_title)
+    parts.append(c.current_title)   # repeat for weight
+    parts.append(c.current_company)
+    parts.append(c.current_industry)
+
+    # Headline + summary
+    if c.headline:
+        parts.append(c.headline)
+    if c.summary:
+        parts.append(c.summary)
+
+    # Skills — repeat by proficiency so expert > advanced > intermediate > beginner
+    repeat_map = {"expert": 4, "advanced": 3, "intermediate": 2, "beginner": 1}
+    for skill in c.skills:
+        repeats = repeat_map.get(skill.proficiency, 1)
+        parts.extend([skill.name_raw] * repeats)
+
+    # Career history — titles, companies, industries, descriptions
+    for job in c.career_history:
+        parts.append(job.title)
+        parts.append(job.company)
+        parts.append(job.industry)
+        if job.description:
+            parts.append(job.description)
+
+    # Education
+    for edu in c.education:
+        parts.append(f"{edu.degree} {edu.field_of_study} {edu.institution}")
+
+    # Location
+    parts.append(c.location)
+
+    return " ".join(p for p in parts if p and p.strip())
+
+
+# ── BM25 core ─────────────────────────────────────────────────────────────────
+
+class _BM25Core:
+    """
+    Pure Okapi BM25 over a pre-tokenized corpus.
+    Separated from BM25Index so it can be pickled cleanly.
+    """
+
+    def __init__(self, corpus: list[list[str]], k1: float = 1.5, b: float = 0.75) -> None:
         self.k1 = k1
         self.b = b
-        self.corpus_size = len(corpus)
-        self.avg_doc_len = sum(len(doc) for doc in corpus) / self.corpus_size if self.corpus_size > 0 else 0
-        self.doc_lengths = [len(doc) for doc in corpus]
-        self.doc_freqs = collections.Counter()
-        self.inverted_index = collections.defaultdict(dict)
-        self._build_index(corpus)
+        self.n = len(corpus)
+        self.avg_dl = sum(len(d) for d in corpus) / self.n if self.n else 1.0
+        self.dl = [len(d) for d in corpus]
 
-    def _build_index(self, corpus):
+        # df[token] = number of documents containing token
+        self.df: dict[str, int] = collections.defaultdict(int)
+        # inverted_index[token][doc_idx] = term frequency
+        self.inv: dict[str, dict[int, int]] = collections.defaultdict(dict)
+
+        self._build(corpus)
+
+    def _build(self, corpus: list[list[str]]) -> None:
         for idx, doc in enumerate(corpus):
             counts = collections.Counter(doc)
             for token, freq in counts.items():
-                self.inverted_index[token][idx] = freq
-                self.doc_freqs[token] += 1
+                self.inv[token][idx] = freq
+                self.df[token] += 1
 
-    def get_scores(self, query_tokens):
-        scores = collections.defaultdict(float)
+    def score(self, query_tokens: list[str]) -> dict[int, float]:
+        scores: dict[int, float] = collections.defaultdict(float)
         for token in query_tokens:
-            if token not in self.inverted_index:
+            if token not in self.inv:
                 continue
-            df = self.doc_freqs[token]
-            idf = math.log((self.corpus_size - df + 0.5) / (df + 0.5) + 1.0)
-            
-            for doc_idx, freq in self.inverted_index[token].items():
-                doc_len = self.doc_lengths[doc_idx]
-                numerator = freq * (self.k1 + 1)
-                denominator = freq + self.k1 * (1 - self.b + self.b * (doc_len / self.avg_doc_len))
-                scores[doc_idx] += idf * (numerator / denominator)
+            df = self.df[token]
+            idf = math.log((self.n - df + 0.5) / (df + 0.5) + 1.0)
+            for doc_idx, tf in self.inv[token].items():
+                dl = self.dl[doc_idx]
+                tf_norm = (tf * (self.k1 + 1)) / (
+                    tf + self.k1 * (1 - self.b + self.b * (dl / self.avg_dl))
+                )
+                scores[doc_idx] += idf * tf_norm
         return scores
 
-# ---------------------------------------------------------
-# 3. TEXT HANDLING UTILITIES
-# ---------------------------------------------------------
-def normalize_text(text):
-    """Tokenization engine parsing alphanumeric & special programming text hooks."""
-    if not text:
-        return []
-    text = text.lower()
-    return re.findall(r'\b[a-z0-9\+\#\-\.]+\b', text)
 
-def get_fully_expanded_query(user_query):
-    """
-    Expands the query token stream using the entire structural schema matrix 
-    extracted from the full file.
-    """
-    tokens = normalize_text(user_query)
-    expanded_tokens = collections.defaultdict(float)
-    
-    for token in tokens:
-        # Step A: Give the base keyword maximum matching value
-        expanded_tokens[token] += 1.0
-        
-        # Step B: Loop over the full matrix map to capture structural relationships
-        for entity, weight in FULL_ONTOLOGY_MATRIX.items():
-            if token in entity or entity in token:
-                # Capture structural synonyms/links anywhere in the JSON data stream
-                expanded_tokens[entity] += (weight * 0.5)
-                
-    return expanded_tokens
+# ── Public class ──────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------
-# 4. COMPREHENSIVE MATCH PIPELINE ENGINE
-# ---------------------------------------------------------
-def rank_candidates_with_full_matrix(job_description, candidates):
-    """Ranks candidates across the full text index with no selective parameters."""
-    # 1. Expand query utilizing all tokens extracted from the file structure
-    query_expansion = get_fully_expanded_query(job_description)
-    query_tokens = list(query_expansion.keys())
-    
-    # 2. Clean candidate profile logs
-    tokenized_resumes = [normalize_text(c["resume_text"]) for c in candidates]
-    
-    # 3. Process the Inverted BM25 Index matching pass
-    engine = FullTextBM25Index(tokenized_resumes)
-    lexical_scores = engine.get_scores(query_tokens)
-    
-    ranked_pipeline = []
-    
-    # 4. Structural Verification & Alignment Calculation Pass
-    for idx, cand in enumerate(candidates):
-        base_score = lexical_scores.get(idx, 0.0)
-        cand_tokens_set = set(tokenized_resumes[idx])
-        
-        # Award dynamic structural score points if other related keywords overlap
-        co_occurrence_credit = 0.0
-        for token in query_tokens:
-            if token in cand_tokens_set:
-                co_occurrence_credit += 0.10
-                
-        final_score = base_score + co_occurrence_credit
-        ranked_pipeline.append({
-            "id": cand["id"],
-            "name": cand["name"],
-            "final_score": round(final_score, 4),
-            "lexical_score": round(base_score, 4)
-        })
-        
-    return sorted(ranked_pipeline, key=lambda x: x["final_score"], reverse=True)
+class BM25Index:
+    """
+    Keyword retrieval index over CandidateFeatureVector.
+
+    API mirrors FaissIndex:
+        .build(candidates, save=True)
+        .load()
+        .search(query_text, top_k) → list[tuple[str, float]]
+    """
+
+    def __init__(
+        self,
+        index_path: Path = config.BM25_INDEX_PATH,
+    ) -> None:
+        self.index_path = index_path
+        self._core: Optional[_BM25Core] = None
+        self._id_map: Optional[list[str]] = None   # position → candidate_id
+
+    # ── Build ─────────────────────────────────────────────────────────────────
+
+    def build(
+        self,
+        candidates: list[CandidateFeatureVector],
+        save: bool = True,
+    ) -> None:
+        """
+        Tokenize all candidates and build the BM25 inverted index.
+
+        Args:
+            candidates: parsed CandidateFeatureVector list
+            save:       persist to disk for reuse
+        """
+        if not candidates:
+            raise ValueError("candidates list is empty — nothing to index.")
+
+        logger.info("Building BM25 index for %d candidates...", len(candidates))
+
+        corpus = [_tokenize(_build_candidate_text(c)) for c in candidates]
+        id_map = [c.candidate_id for c in candidates]
+
+        self._core   = _BM25Core(corpus)
+        self._id_map = id_map
+
+        logger.info(
+            "BM25 index built: %d candidates, %d unique tokens, avg_dl=%.1f",
+            len(candidates),
+            len(self._core.df),
+            self._core.avg_dl,
+        )
+
+        if save:
+            self._save()
+
+    # ── Load ──────────────────────────────────────────────────────────────────
+
+    def load(self) -> None:
+        """Load pre-built index from disk."""
+        if not self.index_path.exists():
+            raise FileNotFoundError(
+                f"BM25 index not found at '{self.index_path}'. "
+                "Run .build() first."
+            )
+        with open(self.index_path, "rb") as f:
+            payload = pickle.load(f)
+        self._core   = payload["core"]
+        self._id_map = payload["id_map"]
+        logger.info(
+            "Loaded BM25 index: %d candidates from '%s'",
+            len(self._id_map), self.index_path,
+        )
+
+    # ── Search ────────────────────────────────────────────────────────────────
+
+    def search(
+        self,
+        query_text: str,
+        top_k: int = config.KEYWORD_PATH_TOP_K,
+        expand: bool = True,
+    ) -> list[tuple[str, float]]:
+        """
+        Keyword search with optional ontology expansion.
+
+        Args:
+            query_text: raw JD text or skill query string
+            top_k:      number of results to return
+            expand:     whether to expand query via ontology synonyms
+
+        Returns:
+            list of (candidate_id, bm25_score) sorted descending
+        """
+        self._require_loaded()
+
+        tokens = _tokenize(query_text)
+        if expand:
+            tokens = _expand_query(tokens)
+
+        raw_scores = self._core.score(tokens)
+
+        # Sort by score, map idx → candidate_id, return top_k
+        ranked = sorted(raw_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        results = [(self._id_map[idx], float(score)) for idx, score in ranked]
+
+        logger.debug("BM25 top result: %s", results[0] if results else None)
+        return results
+
+    # ── Properties ────────────────────────────────────────────────────────────
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._core is not None and self._id_map is not None
+
+    @property
+    def vocab_size(self) -> int:
+        self._require_loaded()
+        return len(self._core.df)
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def _save(self) -> None:
+        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.index_path, "wb") as f:
+            pickle.dump({"core": self._core, "id_map": self._id_map}, f)
+        logger.info("Saved BM25 index → %s", self.index_path)
+
+    # ── Guards ────────────────────────────────────────────────────────────────
+
+    def _require_loaded(self) -> None:
+        if not self.is_loaded:
+            raise RuntimeError(
+                "BM25Index not loaded. Call .build() or .load() first."
+            )
+
+    def __repr__(self) -> str:
+        status = (
+            f"{len(self._id_map)} candidates, {self.vocab_size} tokens"
+            if self.is_loaded else "not loaded"
+        )
+        return f"BM25Index({status})"
