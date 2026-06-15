@@ -10,6 +10,7 @@ from indexing.bm25_builder import BM25Index
 from indexing.feature_store import FeatureStore
 from scoring.behavioral import BehavioralScorer
 from scoring.trajectory import TrajectoryVelocityScorer
+from scoring.honeypot_filter import HoneypotCleanup
 
 
 DATASET_PATH = Path("sample_candidates.json")
@@ -24,6 +25,9 @@ print("Candidates loaded successfully")
 honeypot_filter = HoneypotFilter()
 honeypot_filter.run_honeypot_filters(candidates)
 print("Honeypot run successfully")
+
+honeypot_cleanup = HoneypotCleanup()
+candidates = honeypot_cleanup.cleanup_candidates(candidates)
 
 trajectory_analyzer = TrajectoryAnalyzer()
 trajectory_analyzer.build_all_feature_vector(candidates)
