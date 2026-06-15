@@ -21,19 +21,6 @@ Confirmed against the actual job_description for this hackathon:
   - Consulting disq. : "People who have only worked at consulting firms
                         (TCS, Infosys, Wipro, Accenture, Cognizant, Capgemini, …)"
   - Locations        : Pune, Noida, Delhi NCR, Hyderabad, Mumbai
-
-Consumed by:
-  - pipeline/runner.py            (called once per ranking run)
-  - ui/app.py                     (called on each Streamlit submit)
-  - tests/test_jd_parser.py
-
-Dependencies:
-  - config.py                     (BI_ENCODER_MODEL, SKILL_MAP_PATH, YOE constants)
-  - pipeline/schemas.py           (JDIntent)
-  - ontology/query_expander.py    (QueryExpander)
-  - ontology/skill_map.json       (vocabulary source)
-  - sentence_transformers         (lazy — only when encode=True)
-  - spacy + en_core_web_sm        (optional — graceful degradation)
 """
 
 from __future__ import annotations
