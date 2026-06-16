@@ -11,6 +11,9 @@ from indexing.feature_store import FeatureStore
 from scoring.behavioral import BehavioralScorer
 from scoring.trajectory import TrajectoryVelocityScorer
 from scoring.honeypot_filter import HoneypotCleanup
+from scoring.career_quality import CareerQualityScorer
+from scoring.skill_match import SkillMatchScorer
+from scoring.composite import CompositeScorer
 
 
 DATASET_PATH = Path("sample_candidates.json")
@@ -79,6 +82,52 @@ for rank, res in enumerate(sorted_trajectory[:5], start=1):
         f"({res.promotions_per_year:.2f}/yr)"
     )
 print("Trajectory Score run successfully")
+
+career_quality_scorer = CareerQualityScorer(intent)
+cqs_results = career_quality_scorer.score_all(candidates)
+
+for r in cqs_results.values():
+    print(
+        f"  {r.candidate_id:<20} "
+        f"final={r.career_quality_score:.4f}  "
+        f"product_co={r.product_co_score:.3f}  "
+        f"yoe={r.yoe_score:.3f}  "
+        f"stability={r.stability_score:.3f}  "
+        f"domain={r.domain_match_score:.3f}  "
+        f"consulting={r.is_consulting_only}"
+    )
+print("Career Quality Scorer run successfully")
+
+skill_match_scorer = SkillMatchScorer(intent)
+sms_results = skill_match_scorer.score_all(candidates)
+for r in sms_results.values():
+        print(
+            f"  {r.candidate_id:<20} "
+            f"final={r.skill_match_score:.4f}  "
+            f"req={r.required_score:.3f}  "
+            f"nice={r.nice_to_have_score:.3f}  "
+            f"hard_disq={r.hard_disqualifier}  "
+            f"soft_disq={r.soft_disqualifier}  "
+            f"matched_req={r.matched_required}"
+        )
+print("Skill Match Scorer run successfully")
+
+composite_scorer = CompositeScorer(intent,candidates, bscorer)
+# ranked = composite_scorer.rank()
+ 
+# print(f"Ranked {len(ranked)} candidates:\n")
+# for rank_pos, r in enumerate(ranked, start=1):
+#     print(
+#         f"  #{rank_pos}  {r.candidate_id:<20} "
+#         f"final={r.final_score:.4f}  "
+#         f"ce={r.cross_encoder_score:.3f}  "
+#         f"skill={r.skill_match_score:.3f}  "
+#         f"career={r.career_quality_score:.3f}  "
+#         f"loc_bonus={r.location_bonus_applied}  "
+#         f"uncertainty={r.uncertainty_penalty_applied}  "
+#         f"hard_disq={r.hard_disqualifier}  "
+#         f"honeypot={r.honeypot_override}"
+    # )
 
 time2 = time.perf_counter()
 print(time2 - time1)
