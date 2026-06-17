@@ -154,8 +154,8 @@ class SemanticPath:
             # or retrieve() will trigger lazy load.
             self._index = None
             self._candidate_ids = np.empty(0, dtype=object)
-            self._loaded: bool = False
 
+        # Unified assignment: True if pre-loaded index was supplied, False otherwise.
         self._loaded: bool = index is not None
 
     # ------------------------------------------------------------------ #
@@ -398,10 +398,12 @@ class SemanticPath:
                 f"candidate_ids array must be 1-D, got shape {arr.shape}."
             )
 
-        # Validate that all entries look like CAND_XXXXXXX
+        # Validate that all entries look like CAND_XXXXXXX.
+        # Sample at least 1% of the array (min 100, max len(arr)) so that
+        # corrupt ID maps in large indexes are not silently missed.
         import re as _re
         _cand_re = _re.compile(r"^CAND_[0-9]{7}$")
-        sample_size = min(10, len(arr))
+        sample_size = min(len(arr), max(100, int(len(arr) * 0.01)))
         for entry in arr[:sample_size]:
             entry_str = str(entry)
             if not _cand_re.match(entry_str):

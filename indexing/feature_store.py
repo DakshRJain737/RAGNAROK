@@ -164,10 +164,11 @@ class FeatureStore:
         else:
             notice_score = 0.1
 
-        # [4] GitHub activity (−1 when not linked → neutral default)
+        # [4] GitHub activity — use has_github property to stay consistent with
+        # behavioral.py which also gates on has_github (not the raw score sentinel).
         github = (
             config.GITHUB_NOT_LINKED_DEFAULT
-            if s.github_activity_score < 0
+            if not s.has_github
             else float(s.github_activity_score) / 100.0
         )
 
