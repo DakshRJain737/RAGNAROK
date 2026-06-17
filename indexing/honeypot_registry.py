@@ -1,5 +1,6 @@
 from pipeline.schemas import CandidateFeatureVector
 import config
+import re
 
 # Proficiency levels that count as meaningful skill claims — O(1) lookup per skill
 _MEANINGFUL_PROFICIENCY = frozenset(("expert", "advanced", "intermediate"))
@@ -10,38 +11,44 @@ class HoneypotFilter:
     # 2. Check if skills are actually mentioned in career descriptions
     def __filter2(self, candidate: CandidateFeatureVector) -> bool:
         skills = candidate.skills
+
         if not skills or not candidate.career_history:
             return False
-
+        
         # Pre-filter to meaningful skills before paying the cost of building career text
         qualifying_skills = [
             skill.name.lower()
             for skill in skills
-            if skill.proficiency
+            if skill.proficiency and skill.name
             and skill.proficiency.lower() in _MEANINGFUL_PROFICIENCY
-            and skill.name
         ]
+
         if not qualifying_skills:
             return False
 
-        full_career_text = " ".join(
-            career.description.lower()
-            for career in candidate.career_history
-            if career.description
-        )
+        descriptions = [c.description.lower() for c in candidate.career_history if c.description]
+        if not descriptions:
+            return False
+        full_career_text = " ".join(descriptions)
+
         if not full_career_text:
             return False
-
+        
+        match_count = 0
         for skill_name in qualifying_skills:
-            if skill_name in full_career_text:
-                return True
-        return False
+            pattern = r'\b' + re.escape(skill_name) + r'\b'
+            if re.search(pattern, full_career_text):
+                match_count += 1
+    
+        match_ratio = match_count / len(qualifying_skills)
+        return match_ratio >= 0.6
 
     # 3. Profile completeness score < threshold with suspiciously many skills
+    # Daksh ---> or must be better than and
     def __filter3(self, candidate: CandidateFeatureVector) -> bool:
         profile_incomplete = candidate.signals.profile_completeness_score < config.HONEYPOT_COMPLETENESS_THRESHOLD
         too_many_skills = len(candidate.skills) > config.HONEYPOT_SKILLS_STUFFING_COUNT
-        return profile_incomplete or too_many_skills
+        return profile_incomplete and too_many_skills
 
     # 4. Salary min > max anomaly
     def __filter4(self, candidate: CandidateFeatureVector) -> bool:
@@ -49,10 +56,11 @@ class HoneypotFilter:
 
     # 5. Experience discrepancy check
     def __filter5(self, candidate: CandidateFeatureVector) -> bool:
+        
         total_duration_months = sum(
             career.duration_months
-            for career in candidate.career_history
-            if career.duration_months
+            for career in candidate.career_history 
+            if career.duration_months is not None
         )
         total_duration_years = total_duration_months / 12.0
         return (total_duration_years - config.HONEYPOT_YOE_DISCREPANCY_YEARS) > candidate.years_of_experience
@@ -73,6 +81,6 @@ class HoneypotFilter:
             if self.__filter5(candidate):
                 candidate.is_honeypot = True
                 continue
-            if self.__filter2(candidate):
-                candidate.is_honeypot = True
-                continue
+            # if not self.__filter2(candidate):
+            #     candidate.is_honeypot = True
+                

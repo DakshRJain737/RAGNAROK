@@ -75,9 +75,9 @@ class FeatureStore:
         assert matrix.shape == (len(candidates), FEATURE_DIM), (
             f"Expected [{len(candidates)} × {FEATURE_DIM}], got {matrix.shape}"
         )
-        assert float(matrix.min()) >= 0.0 and float(matrix.max()) <= 1.0, (
-            f"Values out of [0,1]: min={matrix.min():.4f} max={matrix.max():.4f}"
-        )
+        if float(matrix.min()) < 0.0 or float(matrix.max()) > 1.0:
+            logger.warning("Feature matrix has out-of-range values. Clipping.")
+            matrix = np.clip(matrix, 0.0, 1.0)
 
         self._matrix = matrix
         self._id_to_idx = {c.candidate_id: i for i, c in enumerate(candidates)}

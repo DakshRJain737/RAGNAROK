@@ -119,7 +119,7 @@ class CareerQualityScorer:
         product_months = sum(
             j.duration_months
             for j in history
-            if j.company_lower not in _CONSULTING_FIRMS
+            if j.industry_lower in config.PRODUCT_INDUSTRIES
         )
         return float(product_months) / float(total_months)
 

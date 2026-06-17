@@ -14,9 +14,10 @@ from scoring.honeypot_filter import HoneypotCleanup
 from scoring.career_quality import CareerQualityScorer
 from scoring.skill_match import SkillMatchScorer
 from scoring.composite import CompositeScorer
+from retrieval.rrf_fusion import RRFFusion
 
 
-DATASET_PATH = Path("sample_candidates.json")
+DATASET_PATH = config.SAMPLE_CANDIDATES_JSON
 
 time1 = time.perf_counter()
 
@@ -29,6 +30,10 @@ honeypot_filter = HoneypotFilter()
 honeypot_filter.run_honeypot_filters(candidates)
 print("Honeypot run successfully")
 
+for cand in candidates:
+     if cand.is_honeypot:
+          print("Honey pot yes")
+
 honeypot_cleanup = HoneypotCleanup()
 candidates = honeypot_cleanup.cleanup_candidates(candidates)
 
@@ -37,7 +42,7 @@ trajectory_analyzer.build_all_feature_vector(candidates)
 print("Trajectory Analyzer run successfully")
 
 parser = JDParser()
-intent = parser.parse(Path("job_description.md"), encode=False)  # encode=False skips model load
+intent = parser.parse(config.JD_PATH, encode=True)  # encode=False skips model load
 print("Job description parser run successfully")
 
 fi = FaissIndex()
@@ -66,6 +71,7 @@ print("Behavioual Score run successfully")
 
 tscorer = TrajectoryVelocityScorer()
 traj_results = tscorer.score_all(candidates)
+# Then save to config.TRAJECTORY_PATH / TRAJECTORY_IDS_PATH
 sorted_trajectory = sorted(
     traj_results, 
     key=lambda x: x.trajectory_velocity, 
@@ -98,8 +104,8 @@ for r in cqs_results.values():
     )
 print("Career Quality Scorer run successfully")
 
-skill_match_scorer = SkillMatchScorer(intent)
-sms_results = skill_match_scorer.score_all(candidates)
+skill_match_scorer = SkillMatchScorer()
+sms_results = skill_match_scorer.score_all(candidates, intent)
 for r in sms_results.values():
         print(
             f"  {r.candidate_id:<20} "
@@ -112,7 +118,10 @@ for r in sms_results.values():
         )
 print("Skill Match Scorer run successfully")
 
-composite_scorer = CompositeScorer(intent,candidates, bscorer)
+# rrf_fusion = RRFFusion()
+# rrf_fusion.fuse()
+
+# composite_scorer = CompositeScorer(intent,candidates, bscorer)
 # ranked = composite_scorer.rank()
  
 # print(f"Ranked {len(ranked)} candidates:\n")

@@ -135,6 +135,9 @@ def trajectory_velocity_score(rate: float) -> float:
     """
     floor = config.TRAJECTORY_PROMOTIONS_PER_YEAR_FLOOR
     cap = config.TRAJECTORY_PROMOTIONS_PER_YEAR_CAP
+    if cap <= floor:
+        logger.warning("TRAJECTORY cap <= floor; returning 0.0 for all candidates.")
+        return 0.0
     normalized = (rate - floor) / (cap - floor)
     return float(np.clip(normalized, 0.0, 1.0))
 
@@ -189,3 +192,4 @@ class TrajectoryVelocityScorer:
             )
             for r in results
         ]
+
