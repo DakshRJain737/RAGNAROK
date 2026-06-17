@@ -101,6 +101,12 @@ RRF_K: int = 60
 RRF_ONTOLOGY_PATH_BONUS: float = 1.3   # Path 3 score multiplied by this
 RRF_SIGNAL_PATH_BONUS: float = 1.1     # Path 5 score multiplied by this
 
+# Cross-encoder blend factor used in scoring/composite.py.
+# final = (1 - CE_BLEND_FACTOR) × weighted_sum + CE_BLEND_FACTOR × ce_score
+# 0.30 = cross-encoder has ~30% influence on final score.
+# Tune during Phase 6 calibration: higher values trust CE more over config weights.
+CE_BLEND_FACTOR: float = 0.30
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COMPOSITE SCORING WEIGHTS
