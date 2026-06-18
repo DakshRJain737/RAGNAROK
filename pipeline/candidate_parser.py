@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import date
 from .schemas import (
     CandidateFeatureVector,
@@ -9,6 +10,15 @@ from .schemas import (
 )
 import config
 from pathlib import Path
+
+try:
+    from tqdm import tqdm
+    _TQDM_AVAILABLE = True
+except ImportError:
+    _TQDM_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+
 
 class CandidateParser:
 
@@ -127,4 +137,68 @@ class CandidateParser:
             candidates = [self.parse_candidate(item) for item in data_list]
             # print(candidates[0])
             return candidates
-        
+
+    def build_candidate_list_from_jsonl(
+        self,
+        file_path: Path,
+    ) -> list[CandidateFeatureVector]:
+        """
+        Stream-parse a .jsonl file line-by-line into CandidateFeatureVector objects.
+
+        Uses byte-level tqdm progress (no need to pre-count lines), so the
+        progress bar is accurate even for very large files. Skips malformed
+        lines and logs a warning rather than crashing the whole run.
+
+        Args:
+            file_path: Path to the .jsonl file (one JSON object per line).
+
+        Returns:
+            List of CandidateFeatureVector objects.
+        """
+        file_path = Path(file_path)
+        file_size = file_path.stat().st_size
+
+        candidates: list[CandidateFeatureVector] = []
+        errors = 0
+
+        if _TQDM_AVAILABLE:
+            progress = tqdm(
+                total=file_size,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc=f"Loading {file_path.name}",
+                dynamic_ncols=True,
+            )
+        else:
+            progress = None
+            logger.info("tqdm not available — loading %s without progress bar", file_path.name)
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as fh:
+                for line_no, raw_line in enumerate(fh, start=1):
+                    if progress is not None:
+                        progress.update(len(raw_line.encode("utf-8")))
+
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        item = json.loads(line)
+                        candidates.append(self.parse_candidate(item))
+                    except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                        errors += 1
+                        logger.warning(
+                            "Skipping line %d — parse error: %s", line_no, exc
+                        )
+        finally:
+            if progress is not None:
+                progress.close()
+
+        logger.info(
+            "JSONL load complete: %d candidates parsed, %d lines skipped (errors)",
+            len(candidates),
+            errors,
+        )
+        return candidates
