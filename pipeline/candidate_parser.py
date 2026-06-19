@@ -142,19 +142,6 @@ class CandidateParser:
         self,
         file_path: Path,
     ) -> list[CandidateFeatureVector]:
-        """
-        Stream-parse a .jsonl file line-by-line into CandidateFeatureVector objects.
-
-        Uses byte-level tqdm progress (no need to pre-count lines), so the
-        progress bar is accurate even for very large files. Skips malformed
-        lines and logs a warning rather than crashing the whole run.
-
-        Args:
-            file_path: Path to the .jsonl file (one JSON object per line).
-
-        Returns:
-            List of CandidateFeatureVector objects.
-        """
         file_path = Path(file_path)
         file_size = file_path.stat().st_size
 
