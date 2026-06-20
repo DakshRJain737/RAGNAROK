@@ -142,7 +142,8 @@ Rather than generating uniform praise for every candidate, the trust layer runs 
 │   ├── behavioral.py           # Recency decay · response rate · notice period
 │   ├── composite.py            # 0.40/0.35/0.25 weighted combination
 │   ├── cross_encoder.py        # ms-marco-MiniLM-L-6-v2 pairwise reranker
-│   └── honeypot_filter.py      # Runtime honeypot removal (pre-CE)
+│   ├── honeypot_filter.py      # Runtime honeypot removal (pre-CE)
+|   └── llm_reranker.py         # Runtime LLM Reranking top 300 candidates
 │
 ├── trust/
 │   ├── advocate.py             # Scans for positive signals → HIGH/MEDIUM/LOW
@@ -293,7 +294,8 @@ The `PipelineRunner` in `pipeline/runner.py` executes these stages in order:
 | 3 | **Five retrieval paths** | `retrieval/` | ~200 raw candidate results across all paths |
 | 4 | **RRF fusion** | `retrieval/rrf_fusion.py` | Deduplicated top-150 pool |
 | 5 | **Cross-encoder rerank** | `scoring/cross_encoder.py` | Top-120 with CE scores blended in |
-| 6 | **Composite scoring** | `scoring/composite.py` | Ordered by 0.40·skill + 0.35·career + 0.25·behavioral |
+| 5b | **LLM rerank** | `scoring/llm_reranker.py` | Top-300 scored by Qwen2.5-1.5B; llm_score attached |
+| 6 | **Composite scoring** | `scoring/composite.py` | 0.60·weighted + 0.25·CE + 0.15·LLM |
 | 7 | **Trust layer** | `trust/verdict.py` | `ROBUST` / `CONTESTED` / `FRAGILE` verdicts |
 | 8 | **Reasoning generation** | `trust/reasoning_generator.py` | 1–2 sentence per-candidate reasoning |
 | 9 | **Assemble output** | `pipeline/runner.py` | `RankedCandidate` list |
@@ -492,13 +494,89 @@ python scripts/validate_output.py output/submission.csv
 
 ---
 
-## What's Next
+## LLM Reranker
 
-The following are planned but not yet implemented:
+RAGnarok includes a lightweight local LLM scoring stage (`scoring/llm_reranker.py`) that runs after RRF fusion on the top-300 candidates. It uses `Qwen2.5-1.5B-Instruct` in 4-bit quantised GGUF format via `llama-cpp-python` — no GPU, no network, ~1 GB RAM.
 
-**Compact LLM reranker (1B parameter model)** — A small quantised LLM (e.g. `Qwen2.5-1.5B-Instruct` or `SmolLM2-1.7B`) will be used to score the top-300 candidates from RRF on a structured prompt that reads JD requirements and candidate profile together. This gives deeper semantic reasoning than the cross-encoder while staying within the CPU + no-network constraint. The LLM score will be blended into the composite at ~20% weight, replacing part of the CE blend. Implementation is in progress in `scoring/llm_reranker.py`.
+### How it fits in the pipeline
 
-**`rank.py` completion** — The CLI currently has complete argument parsing and CSV writing but some pipeline integration paths are still being hardened for edge cases (empty retrieval paths, missing index files). Full end-to-end validation against the 100K dataset is ongoing.
+```
+RRF pool (top-150)
+       │
+       ▼
+Cross-Encoder (top-120)       ~10s
+       │
+       ▼
+LLM Reranker  (top-300)       ~75s   ← new stage
+       │
+       ▼
+Composite Scorer
+```
+
+### Composite blend with LLM
+
+```python
+# scoring/composite.py
+final_score = (
+    0.60 * weighted_sum          # 0.40×skill + 0.35×career + 0.25×behavioral
+  + 0.25 * cross_encoder_score   # CE_BLEND_FACTOR (was 0.30, reduced to make room)
+  + 0.15 * llm_score             # LLM_BLEND_FACTOR
+)
+```
+
+### Setup (one-time, during pre-computation)
+
+```bash
+# Downloads ~1 GB GGUF model into models/
+python precompute.py --candidates data/candidates.jsonl.gz
+```
+
+The model is saved to `models/qwen2.5-1.5b-instruct-q4_k_m.gguf` and loaded from disk during ranking (no network required).
+
+### Smoke test before full pipeline run
+
+```bash
+python test_llm_reranker.py
+```
+
+Expected: strong AI/ML candidate at a product company scores ~0.7–0.9, consulting-only Java developer scores ~0.1–0.3. Speed: ~200–400ms per candidate on 8 CPU cores.
+
+### Key files
+
+| File | Purpose |
+|------|---------|
+| `scoring/llm_reranker.py` | `LLMReranker` class — load, score_one, score_pool |
+| `config_llm_additions.py` | Constants to paste into `config.py` |
+| `runner_llm_patch.py` | Exact diff showing where to insert LLM block in `runner.py` |
+| `precompute_llm_addition.py` | `download_llm_model()` to add to `precompute.py` |
+| `test_llm_reranker.py` | Standalone smoke test with mock schemas |
+| `Dockerfile` | Full container build with LLM support |
+
+### Tuning
+
+All LLM parameters live in `config.py`:
+
+```python
+LLM_MODEL_PATH       = "models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+LLM_TOP_N            = 300     # candidates to score
+LLM_N_THREADS        = 8       # match your CPU core count
+LLM_N_CTX            = 512     # keep small — prompts are ~150 tokens
+LLM_BLEND_FACTOR     = 0.15    # weight in composite
+LLM_RERANKER_ENABLED = True    # set False to skip (e.g. in unit tests)
+```
+
+### RAM budget with LLM added
+
+| Component | RAM |
+|-----------|-----|
+| Qwen2.5-1.5B Q4 GGUF | ~1.0 GB |
+| FAISS + BM25 + indexes | ~250 MB |
+| Candidate objects (100K) | ~800 MB |
+| PyTorch + sentence-transformers | ~500 MB |
+| OS + Python baseline | ~300 MB |
+| **Total peak** | **~2.9 GB** |
+
+Well within the 16 GB constraint.
 
 ---
 

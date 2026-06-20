@@ -138,5 +138,28 @@ print("Skill Match Scorer run successfully")
 #         f"honeypot={r.honeypot_override}"
     # )
 
+# How to run the LLM
+# if config.LLM_RERANKER_ENABLED:
+#             try:
+#                 from scoring.llm_reranker import LLMReranker
+#                 llm = LLMReranker()
+#                 rrf_pool = llm.score_pool(
+#                     rrf_pool,
+#                     self._jd,
+#                     self._candidate_store,
+#                     top_n=config.LLM_TOP_N,
+#                 )
+#             except Exception as e:
+#                 logger.warning("LLM reranker unavailable: %s — skipping", e)
+#                 # Set neutral scores so composite.py blend factor doesn't explode
+#                 for r in rrf_pool:
+#                     if not hasattr(r, "llm_score"):
+#                         r.llm_score = 0.5
+#         else:
+#             logger.info("LLM reranker disabled (LLM_RERANKER_ENABLED=False)")
+#             for r in rrf_pool:
+#                 r.llm_score = 0.5
+#         timings["llm_reranker"] = (time.perf_counter() - t0) * 1000
+
 time2 = time.perf_counter()
 print(time2 - time1)

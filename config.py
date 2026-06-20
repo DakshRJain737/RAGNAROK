@@ -352,3 +352,42 @@ SUBMISSION_CANDIDATE_ID_PATTERN: str = r"^CAND_[0-9]{7}$"
 SUBMISSION_EXPECTED_ROWS: int = 100
 SUBMISSION_RANK_MIN: int = 1
 SUBMISSION_RANK_MAX: int = 100
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# Path to the downloaded GGUF model file.
+# Run precompute.py once to download it; rank.py loads from here (no network).
+LLM_MODEL_PATH: str = str(Path("models/qwen2.5-1.5b-instruct-q4_k_m.gguf"))
+ 
+# How many RRF survivors to pass through the LLM scorer.
+# These are already filtered by honeypot + RRF — LLM is a final quality gate.
+# At ~200-300ms/candidate on 8 cores: 300 ≈ 75s, well within 5-min budget.
+LLM_TOP_N: int = 300
+ 
+# CPU threads for llama.cpp inference.
+# Set to your machine's physical core count for best throughput.
+LLM_N_THREADS: int = 8
+ 
+# Context window. Keep small (512-1024) — our prompts are ~150 tokens.
+# Larger context = more RAM + slower inference.
+LLM_N_CTX: int = 512
+ 
+# Blend factor for LLM score in composite.py.
+# final = (1 - CE_BLEND - LLM_BLEND) * weighted_sum
+#        + CE_BLEND  * cross_encoder_score
+#        + LLM_BLEND * llm_score
+# Adjust CE_BLEND_FACTOR down when adding LLM_BLEND so total = 1.0
+LLM_BLEND_FACTOR: float = 0.15   # was 0.0 before LLM integration
+ 
+# Whether to run the LLM reranker. Set False to skip entirely (e.g. for tests).
+LLM_RERANKER_ENABLED: bool = True
+ 
+# HuggingFace repo and filename used by LLMReranker.download_model()
+# Called only from precompute.py — never from rank.py
+LLM_HF_REPO_ID: str   = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
+LLM_HF_FILENAME: str  = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+LLM_MODEL_DIR: str    = "models/"
