@@ -105,6 +105,37 @@ class CandidateParser:
             for company in companies
         )
 
+        # Build embedding_text to be used by retrieval indexes
+        parts = []
+        parts.append(profile.get("current_title", ""))
+        parts.append(profile.get("current_title", ""))
+        parts.append(profile.get("current_company", ""))
+        parts.append(profile.get("current_industry", ""))
+
+        if profile.get("headline"):
+            parts.append(profile.get("headline"))
+        if profile.get("summary"):
+            parts.append(profile.get("summary"))
+
+        repeat_map = {"expert": 4, "advanced": 3, "intermediate": 2, "beginner": 1}
+        for skill in skills:
+            repeats = repeat_map.get(skill.proficiency, 1)
+            parts.extend([skill.name_raw] * repeats)
+
+        for job in career_history:
+            parts.append(job.title)
+            parts.append(job.company)
+            parts.append(job.industry)
+            if job.description:
+                parts.append(job.description)
+
+        for edu in education:
+            parts.append(f"{edu.degree} {edu.field_of_study} {edu.institution}")
+
+        parts.append(profile.get("location", ""))
+
+        embedding_text = " ".join(p for p in parts if p and str(p).strip())
+
         return CandidateFeatureVector(
             candidate_id=item["candidate_id"],
             headline=profile["headline"],
@@ -128,7 +159,7 @@ class CandidateParser:
             has_product_co_experience=has_product_co_experience,
             total_career_months=sum(c.duration_months for c in career_history),
             skill_names_lower=frozenset(s.name for s in skills),
-            embedding_text=""
+            embedding_text=embedding_text
         )
     
     def build_candidate_list(self, filePath : Path) -> list[CandidateFeatureVector]:

@@ -75,8 +75,10 @@ class PipelineRunner:
         t0 = time.perf_counter()
         try:
             from indexing.honeypot_registry import HoneypotFilter
-            hpf = HoneypotFilter()
-            hpf.run_honeypot_filters(self._candidates)
+            honeypot_ids = HoneypotFilter.load_honeypots()
+            for c in self._candidates:
+                if c.candidate_id in honeypot_ids:
+                    c.is_honeypot = True
         except Exception as e:
             logger.warning("Honeypot filter unavailable: %s", e)
         timings["honeypot_filter"] = (time.perf_counter() - t0) * 1000
@@ -88,70 +90,69 @@ class PipelineRunner:
 
         # ── 2. Load indexes ───────────────────────────────────────────────
         t0 = time.perf_counter()
-        faiss_index = bm25_index = feature_store = trajectory_store = None
-        try:
-            from indexing.faiss_builder import FaissIndex
-            faiss_index = FaissIndex()
-            faiss_index.load()
-        except Exception as e:
-            logger.warning("FAISS index unavailable: %s", e)
-        try:
-            from indexing.bm25_builder import BM25Index
-            bm25_index = BM25Index()
-            bm25_index.load()
-        except Exception as e:
-            logger.warning("BM25 index unavailable: %s", e)
-        try:
-            from indexing.feature_store import FeatureStore
-            feature_store = FeatureStore()
-            feature_store.load()
-        except Exception as e:
-            logger.warning("Feature store unavailable: %s", e)
+        # Indexes are now loaded lazily inside the paths via from_disk()
         timings["load_indexes"] = (time.perf_counter() - t0) * 1000
 
         # ── 3. Run 5 retrieval paths ──────────────────────────────────────
         t0 = time.perf_counter()
         all_retrieval_results = []
+        path_results = {}
 
         # Path 1: Semantic (FAISS)
         try:
             from retrieval.semantic_path import SemanticPath
-            sp = SemanticPath(faiss_index)
-            all_retrieval_results.extend(sp.retrieve(self._jd, top_k=config.SEMANTIC_PATH_TOP_K))
+            sp = SemanticPath.from_disk()
+            res = sp.retrieve(self._jd, top_k=config.SEMANTIC_PATH_TOP_K)
+            path_results["semantic"] = res
+            all_retrieval_results.extend(res)
         except Exception as e:
-            logger.warning("Semantic path failed: %s", e)
+            logger.error("Semantic path failed: %s", e)
+            raise RuntimeError(f"Semantic path failed: {e}") from e
 
         # Path 2: Keyword (BM25)
         try:
             from retrieval.keyword_path import KeywordPath
-            kp = KeywordPath(bm25_index)
-            all_retrieval_results.extend(kp.retrieve(self._jd, top_k=config.KEYWORD_PATH_TOP_K))
+            kp = KeywordPath.from_disk()
+            res = kp.retrieve(self._jd, top_k=config.KEYWORD_PATH_TOP_K)
+            path_results["keyword"] = res
+            all_retrieval_results.extend(res)
         except Exception as e:
-            logger.warning("Keyword path failed: %s", e)
+            logger.error("Keyword path failed: %s", e)
+            raise RuntimeError(f"Keyword path failed: {e}") from e
 
         # Path 3: Ontology
         try:
             from retrieval.ontology_path import OntologyPath
-            op = OntologyPath(self._candidate_store)
-            all_retrieval_results.extend(op.retrieve(self._jd, top_k=config.ONTOLOGY_PATH_TOP_K))
+            op = OntologyPath.from_skill_map()
+            skills_map = OntologyPath.build_skills_map(self._candidates)
+            res = op.retrieve(self._jd, candidate_skills_map=skills_map, top_k=config.ONTOLOGY_PATH_TOP_K)
+            path_results["ontology"] = res
+            all_retrieval_results.extend(res)
         except Exception as e:
-            logger.warning("Ontology path failed: %s", e)
+            logger.error("Ontology path failed: %s", e)
+            raise RuntimeError(f"Ontology path failed: {e}") from e
 
         # Path 4: Trajectory
         try:
             from retrieval.trajectory_path import TrajectoryPath
-            tp = TrajectoryPath(self._candidate_store)
-            all_retrieval_results.extend(tp.retrieve(self._jd, top_k=config.TRAJECTORY_PATH_TOP_K))
+            tp = TrajectoryPath.from_disk()
+            res = tp.retrieve(self._jd, top_k=config.TRAJECTORY_PATH_TOP_K)
+            path_results["trajectory"] = res
+            all_retrieval_results.extend(res)
         except Exception as e:
-            logger.warning("Trajectory path failed: %s", e)
+            logger.error("Trajectory path failed: %s", e)
+            raise RuntimeError(f"Trajectory path failed: {e}") from e
 
         # Path 5: Signal (behavioral)
         try:
             from retrieval.signal_path import SignalPath
-            sigp = SignalPath(feature_store, self._candidate_store)
-            all_retrieval_results.extend(sigp.retrieve(self._jd, top_k=config.SIGNAL_PATH_TOP_K))
+            sigp = SignalPath.from_disk()
+            res = sigp.retrieve(top_k=config.SIGNAL_PATH_TOP_K)
+            path_results["signal"] = res
+            all_retrieval_results.extend(res)
         except Exception as e:
-            logger.warning("Signal path failed: %s", e)
+            logger.error("Signal path failed: %s", e)
+            raise RuntimeError(f"Signal path failed: {e}") from e
 
         timings["retrieval_paths"] = (time.perf_counter() - t0) * 1000
         logger.info("Retrieval: %d total results across all paths", len(all_retrieval_results))
@@ -162,22 +163,10 @@ class PipelineRunner:
         try:
             from retrieval.rrf_fusion import RRFFusion
             rrf = RRFFusion()
-            rrf_pool = rrf.fuse(all_retrieval_results, top_n=config.RRF_POOL_SIZE)
+            rrf_pool = rrf.fuse(path_results)
         except Exception as e:
-            logger.warning("RRF fusion failed: %s — using direct retrieval results", e)
-            # Fallback: deduplicate and take top candidates
-            seen = set()
-            for r in all_retrieval_results:
-                if r.candidate_id not in seen and r.candidate_id not in honeypot_ids:
-                    seen.add(r.candidate_id)
-                    from pipeline.schemas import RRFResult
-                    rrf_pool.append(RRFResult(
-                        candidate_id=r.candidate_id,
-                        rrf_score=r.path_score,
-                        paths_present=[r.path_name],
-                    ))
-                if len(rrf_pool) >= config.RRF_POOL_SIZE:
-                    break
+            logger.error("RRF fusion failed: %s", e)
+            raise RuntimeError(f"RRF fusion failed: {e}") from e
         timings["rrf_fusion"] = (time.perf_counter() - t0) * 1000
         logger.info("RRF pool: %d candidates", len(rrf_pool))
 
@@ -192,7 +181,8 @@ class PipelineRunner:
             ce = CrossEncoderReranker()
             rrf_pool = ce.rerank(rrf_pool, self._jd, self._candidate_store)
         except Exception as e:
-            logger.warning("Cross-encoder unavailable: %s — skipping CE blend", e)
+            logger.error("Cross-encoder unavailable: %s", e)
+            raise RuntimeError(f"Cross-encoder unavailable: {e}") from e
         timings["cross_encoder"] = (time.perf_counter() - t0) * 1000
 
         # ── 6. Composite scoring ──────────────────────────────────────────
@@ -210,81 +200,123 @@ class PipelineRunner:
         timings["composite_scoring"] = (time.perf_counter() - t0) * 1000
         logger.info("Composite scored %d candidates", len(composite_results))
 
-        # ── 7. Trust layer ────────────────────────────────────────────────
+        # ── 7. Trust layer & Reasoning ────────────────────────────────────
         t0 = time.perf_counter()
         trust_verdicts: dict = {}
-        try:
-            from trust.verdict import TrustVerdictEngine
-            trust_engine = TrustVerdictEngine()
-            for cs in composite_results:
-                cfv = self._candidate_store.get(cs.candidate_id)
-                if cfv:
-                    verdict = trust_engine.evaluate(cfv, cs, self._jd)
-                    trust_verdicts[cs.candidate_id] = verdict
-        except Exception as e:
-            logger.warning("Trust layer unavailable: %s — skipping", e)
-        timings["trust_layer"] = (time.perf_counter() - t0) * 1000
-
-        # ── 8. Reasoning generation ───────────────────────────────────────
-        t0 = time.perf_counter()
         reasonings: dict[str, str] = {}
+        schema_components: dict[str, ComponentScores] = {}
+        
+        top_candidates = []
+        for cs in composite_results[:top_k]:
+            cfv = self._candidate_store.get(cs.candidate_id)
+            if cfv:
+                top_candidates.append(cfv)
+                
         try:
-            from trust.reasoning_generator import ReasoningGenerator
-            rgen = ReasoningGenerator()
-            for cs in composite_results:
-                verdict = trust_verdicts.get(cs.candidate_id)
-                cfv = self._candidate_store.get(cs.candidate_id)
-                reasonings[cs.candidate_id] = rgen.generate(cfv, cs, verdict, self._jd)
+            from trust.advocate import build_advocate_signals
+            from trust.skeptic import build_skeptic_signals
+            from trust.verdict import build_verdict
+            from trust.reasoning_generator import generate_reasoning
+            from scoring.skill_match import SkillMatchScorer
+            from scoring.career_quality import CareerQualityScorer
+            from scoring.behavioral import BehavioralScorer
+            
+            skill_results = SkillMatchScorer().score_all(top_candidates, self._jd)
+            career_results = CareerQualityScorer(self._jd).score_all(top_candidates)
+            behavioral_results = BehavioralScorer().score_all(top_candidates)
+            
+            for rank_pos, cs in enumerate(composite_results[:top_k], start=1):
+                cid = cs.candidate_id
+                cfv = self._candidate_store.get(cid)
+                if not cfv:
+                    continue
+                    
+                s_res = skill_results.get(cid)
+                c_res = career_results.get(cid)
+                b_res = behavioral_results.get(cid)
+                
+                if s_res and c_res and b_res:
+                    schema_comp = ComponentScores(
+                        candidate_id=cid,
+                        skill_score=cs.skill_match_score,
+                        career_score=cs.career_quality_score,
+                        behavioral_score=cs.behavioral_score,
+                        required_skill_coverage=s_res.required_score,
+                        nice_to_have_coverage=s_res.nice_to_have_score,
+                        ontology_skills_matched=[],
+                        yoe_score=c_res.yoe_score,
+                        trajectory_velocity=cs.trajectory_velocity,
+                        product_co_flag=cfv.has_product_co_experience,
+                        consulting_only_flag=cfv.is_consulting_only,
+                        location_bonus=cs.location_bonus_applied,
+                        recency_score=b_res.recency_score,
+                        notice_period_score=b_res.notice_period_score,
+                        uncertainty_penalty=cs.uncertainty_penalty_applied,
+                        signal_count=b_res.signal_count,
+                    )
+                    schema_components[cid] = schema_comp
+                    
+                    adv_signals = build_advocate_signals(cfv, schema_comp, s_res, self._jd)
+                    skep_signals = build_skeptic_signals(cfv, schema_comp, c_res, b_res, s_res, self._jd)
+                    verdict = build_verdict(cfv, schema_comp, adv_signals, skep_signals)
+                    trust_verdicts[cid] = verdict
+                    
+                    reasonings[cid] = generate_reasoning(rank_pos, verdict, cfv, schema_comp)
         except Exception as e:
-            logger.warning("Reasoning generator unavailable: %s — using fallback", e)
-            for cs in composite_results:
-                cfv = self._candidate_store.get(cs.candidate_id)
+            logger.error("Trust layer unavailable: %s", e)
+            raise RuntimeError(f"Trust layer unavailable: {e}") from e
+
+        for cs in composite_results[:top_k]:
+            cid = cs.candidate_id
+            if cid not in reasonings:
+                cfv = self._candidate_store.get(cid)
                 yoe = f"{cfv.years_of_experience:.0f}y" if cfv else "?"
-                reasonings[cs.candidate_id] = (
-                    f"Ranked #{cs.candidate_id} with composite score {cs.final_score:.4f}. "
+                reasonings[cid] = (
+                    f"Ranked #{cid} with composite score {cs.final_score:.4f}. "
                     f"Skill: {cs.skill_match_score:.2f}, Career: {cs.career_quality_score:.2f}, "
                     f"Behavioral: {cs.behavioral_score:.2f}. "
                     f"Experience: {yoe}. "
                     f"Retrieved via: {', '.join(cs.paths_present)}."
                 )
-        timings["reasoning"] = (time.perf_counter() - t0) * 1000
+
+        timings["trust_layer"] = (time.perf_counter() - t0) * 1000
 
         # ── 9. Assemble RankedCandidate list ──────────────────────────────
         t0 = time.perf_counter()
         ranked: list[RankedCandidate] = []
 
         for rank_pos, cs in enumerate(composite_results[:top_k], start=1):
-            cfv = self._candidate_store.get(cs.candidate_id)
-            verdict = trust_verdicts.get(cs.candidate_id)
-            reasoning = reasonings.get(cs.candidate_id, "")
-
-            # Build pipeline.schemas.ComponentScores for trust layer compatibility
-            schema_comp = ComponentScores(
-                candidate_id=cs.candidate_id,
-                skill_score=cs.skill_match_score,
-                career_score=cs.career_quality_score,
-                behavioral_score=cs.behavioral_score,
-                required_skill_coverage=0.0,
-                nice_to_have_coverage=0.0,
-                ontology_skills_matched=[],
-                yoe_score=0.0,
-                trajectory_velocity=cs.trajectory_velocity,
-                product_co_flag=cfv.has_product_co_experience if cfv else False,
-                consulting_only_flag=cfv.is_consulting_only if cfv else False,
-                location_bonus=cs.location_bonus_applied,
-                recency_score=0.0,
-                notice_period_score=0.0,
-                uncertainty_penalty=cs.uncertainty_penalty_applied,
-                signal_count=5,
-            )
+            cid = cs.candidate_id
+            cfv = self._candidate_store.get(cid)
+            
+            schema_comp = schema_components.get(cid)
+            if not schema_comp:
+                schema_comp = ComponentScores(
+                    candidate_id=cid,
+                    skill_score=cs.skill_match_score,
+                    career_score=cs.career_quality_score,
+                    behavioral_score=cs.behavioral_score,
+                    required_skill_coverage=0.0,
+                    nice_to_have_coverage=0.0,
+                    ontology_skills_matched=[],
+                    yoe_score=0.0,
+                    trajectory_velocity=cs.trajectory_velocity,
+                    product_co_flag=cfv.has_product_co_experience if cfv else False,
+                    consulting_only_flag=cfv.is_consulting_only if cfv else False,
+                    location_bonus=cs.location_bonus_applied,
+                    recency_score=0.0,
+                    notice_period_score=0.0,
+                    uncertainty_penalty=cs.uncertainty_penalty_applied,
+                    signal_count=5,
+                )
 
             ranked.append(RankedCandidate(
-                candidate_id=cs.candidate_id,
+                candidate_id=cid,
                 rank=rank_pos,
                 final_score=cs.final_score,
-                reasoning=reasoning,
+                reasoning=reasonings.get(cid, ""),
                 components=schema_comp,
-                trust=verdict,
+                trust=trust_verdicts.get(cid),
                 feature_vector=cfv,
             ))
 

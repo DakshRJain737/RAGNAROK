@@ -71,7 +71,7 @@ class FaissIndex:
 
         logger.info("Building FAISS index for %d candidates...", len(candidates))
 
-        texts  = [self._build_embedding_text(c) for c in candidates]
+        texts  = [c.embedding_text for c in candidates]
         id_map = [c.candidate_id for c in candidates]
 
         embeddings = self._encode_batch(texts)
@@ -148,61 +148,6 @@ class FaissIndex:
         self._require_loaded()
         return self._index.ntotal
 
-    # ── Embedding text construction ───────────────────────────────────────────
-
-    @staticmethod
-    def _build_embedding_text(c: CandidateFeatureVector) -> str:
-        """
-        Build a rich text representation of a candidate using ALL available fields.
-
-        Sections (in semantic importance order):
-          1. Current role + headline
-          2. Summary
-          3. Skills (name + proficiency)
-          4. Career history (title + company + industry + description)
-          5. Education (institution + degree + field)
-          6. Location + country
-        """
-        parts: list[str] = []
-
-        parts.append(f"{c.current_title} at {c.current_company}.")
-        parts.append(c.headline)
-
-        if c.summary:
-            parts.append(c.summary)
-
-        # Single pass over skills — avoids 3 separate list comprehensions
-        if c.skills:
-            advanced, intermediate, beginner = [], [], []
-            for s in c.skills:
-                if s.proficiency in _EXPERT_SET:
-                    advanced.append(s.name_raw)
-                elif s.proficiency in _INTERMEDIATE_SET:
-                    intermediate.append(s.name_raw)
-                else:
-                    beginner.append(s.name_raw)
-
-            if advanced:
-                parts.append("Expert skills: " + ", ".join(advanced) + ".")
-            if intermediate:
-                parts.append("Intermediate skills: " + ", ".join(intermediate) + ".")
-            if beginner:
-                parts.append("Familiar with: " + ", ".join(beginner) + ".")
-
-        for job in c.career_history:
-            job_parts = [f"{job.title} at {job.company} ({job.industry})"]
-            if job.description:
-                job_parts.append(job.description)
-            parts.append(" — ".join(job_parts))
-
-        for edu in c.education:
-            parts.append(f"{edu.degree} in {edu.field_of_study} from {edu.institution}.")
-
-        parts.append(f"Location: {c.location}, {c.country}.")
-
-        full_text = " ".join(p.strip() for p in parts if p and p.strip())
-        return full_text[:MAX_TEXT_CHARS]
-
     # ── Encoding ──────────────────────────────────────────────────────────────
 
     def _encode_batch(self, texts: list[str]) -> np.ndarray:
@@ -245,8 +190,7 @@ class FaissIndex:
     def _save(self, index: faiss.Index, id_map: list[str]) -> None:
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         faiss.write_index(index, str(self.index_path))
-        with open(self.id_map_path, "wb") as f:
-            pickle.dump(id_map, f)
+        np.save(str(self.id_map_path), np.array(id_map, dtype=object))
         logger.info("Saved index → %s  |  id_map → %s", self.index_path, self.id_map_path)
 
     # ── Model cache ───────────────────────────────────────────────────────────

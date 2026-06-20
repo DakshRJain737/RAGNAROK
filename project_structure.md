@@ -1,24 +1,15 @@
-# Repository Structure
+# Project Repository Structure
 
-Here is the visual directory tree for your repository (ignoring `.git`, `.venv`, and `__pycache__`):
+Here is the visual directory tree for the core repository (excluding setup/automation scripts and virtual environments):
 
 ```text
 RAGnarok/
 ├── .gitignore
 ├── Daily_Task(sprint planner).html
+├── Dockerfile
 ├── LICENSE
 ├── Optimised_Pipeline.html
 ├── README.md
-├── api
-│   ├── main.py
-│   ├── middleware.py
-│   ├── routes
-│   │   ├── __init__.py
-│   │   ├── health.py
-│   │   └── rank.py
-│   └── schemas.py
-├── build_indexes.py
-├── config.py
 ├── data
 │   ├── .gitkeep
 │   ├── candidates.jsonl
@@ -31,7 +22,6 @@ RAGnarok/
 │   │   ├── honeypots.pkl
 │   │   └── trajectory.npy
 │   └── sample_candidates.json
-├── generate_tree.py
 ├── indexing
 │   ├── bm25_builder.py
 │   ├── faiss_builder.py
@@ -49,8 +39,6 @@ RAGnarok/
 │   ├── jd_parser.py
 │   ├── runner.py
 │   └── schemas.py
-├── precompute.py
-├── rank.py
 ├── requirements.txt
 ├── retrieval
 │   ├── __init__.py
@@ -66,6 +54,7 @@ RAGnarok/
 │   ├── composite.py
 │   ├── cross_encoder.py
 │   ├── honeypot_filter.py
+│   ├── llm_reranker.py
 │   ├── skill_match.py
 │   └── trajectory.py
 ├── scripts
@@ -80,15 +69,9 @@ RAGnarok/
 │   ├── test_reasoning.py
 │   ├── test_retrieval.py
 │   └── test_scoring.py
-├── trust
-│   ├── advocate.py
-│   ├── reasoning_generator.py
-│   ├── skeptic.py
-│   └── verdict.py
-└── ui
-    ├── app.py
-    ├── ats_platform.html
-    └── components
-        ├── candidate_card.py
-        └── score_breakdown.py
+└── trust
+    ├── advocate.py
+    ├── reasoning_generator.py
+    ├── skeptic.py
+    └── verdict.py
 ```

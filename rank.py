@@ -205,9 +205,9 @@ def main() -> None:
     _validate_submission(args.output, args.top_k)
 
     # ── 6. Print top-10 summary ───────────────────────────────────────────────
-    print(f"\n{'─'*70}")
+    print(f"\n{'-'*70}")
     print(f"  RAGnarok — Top {min(10, len(ranked))} Candidates")
-    print(f"{'─'*70}")
+    print(f"{'-'*70}")
     for rc in ranked[:10]:
         verdict = rc.trust.verdict if rc.trust else "—"
         print(
@@ -215,7 +215,7 @@ def main() -> None:
             f"score={rc.final_score:.4f}  verdict={verdict:<10}  "
             f"{rc.reasoning[:60] if rc.reasoning else ''}…"
         )
-    print(f"{'─'*70}")
+    print(f"{'-'*70}")
     print(f"  Output: {args.output}")
     print(f"  Total time: {elapsed:.1f}s")
     print()

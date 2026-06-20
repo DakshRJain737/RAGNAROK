@@ -1,5 +1,10 @@
 import config
 from pipeline.schemas import CandidateFeatureVector
+import numpy as np
+from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Config sets built once at import time — avoids per-call getattr cache checks
 _CONSULTING_FIRMS    = frozenset(f.lower().strip() for f in config.CONSULTING_FIRMS)
@@ -104,3 +109,63 @@ class TrajectoryAnalyzer:
 
     def build_all_feature_vector(self, candidates: list[CandidateFeatureVector]) -> list[dict]:
         return [self.build_feature_vector(c) for c in candidates]
+
+
+class TrajectoryIndex:
+    """
+    Builds and saves the (N, 5) float32 matrix expected by trajectory_path.py.
+    """
+    def __init__(self, index_path: Path = None, ids_path: Path = None) -> None:
+        self.index_path = index_path or config.TRAJECTORY_PATH
+        self.ids_path = ids_path or config.TRAJECTORY_IDS_PATH
+
+    def build(self, candidates: list[CandidateFeatureVector], save: bool = True) -> None:
+        from scoring.trajectory import promotions_per_year, count_promotions, _effective_years
+        
+        logger.info("Building Trajectory Index for %d candidates...", len(candidates))
+        
+        analyzer = TrajectoryAnalyzer()
+        
+        # Keywords that indicate management/executive roles. Principal is often IC, but in 
+        # _SENIORITY_KEYWORDS it's lumped with manager (level 4). We'll assume IC means never manager/exec.
+        management_keywords = ("manager", "director", "head of", "chief", "ceo", "cto", "vp", "president", "founder")
+        
+        rows = []
+        ids = []
+        
+        for c in candidates:
+            # 1. promotions_per_year
+            ppy = promotions_per_year(c)
+            
+            # 2. years_of_experience
+            yoe = _effective_years(c)
+            
+            # 3 & 5. product_co and consulting_only
+            is_consulting, product_exp = analyzer.analyze_career_history(c)
+            
+            # 4. is_ic_riser
+            num_promotions = count_promotions(c.career_history)
+            is_ic_riser = 0.0
+            if num_promotions > 0:
+                has_management = False
+                for job in c.career_history:
+                    title = job.title.lower()
+                    if any(kw in title for kw in management_keywords):
+                        has_management = True
+                        break
+                if not has_management:
+                    is_ic_riser = 1.0
+                    
+            rows.append([ppy, yoe, product_exp, is_ic_riser, is_consulting])
+            ids.append(c.candidate_id)
+            
+        matrix = np.array(rows, dtype=np.float32)
+        
+        if save:
+            self._save(matrix, ids)
+            
+    def _save(self, matrix: np.ndarray, ids: list[str]) -> None:
+        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(str(self.index_path), matrix)
+        np.save(str(self.ids_path), np.array(ids, dtype=object))
+        logger.info("Saved Trajectory Index → %s | ids → %s", self.index_path, self.ids_path)

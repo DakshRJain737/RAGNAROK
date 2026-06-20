@@ -215,6 +215,27 @@ class JDParser:
     # Primary entry point                                                  #
     # ------------------------------------------------------------------ #
 
+    def load_parsed(self, parsed_path: Optional[Path] = None, encode: bool = True) -> JDIntent:
+        """
+        Load a pre-parsed JDIntent from a JSON file.
+        Skips NLP parsing but can run bi-encoder embedding if encode=True.
+        """
+        path = parsed_path or (config.PROJECT_ROOT / "parsed_job_description.json")
+        if not path.exists():
+            raise FileNotFoundError(f"Parsed JD not found at '{path}'")
+        
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            
+        intent = JDIntent(**data)
+        
+        if encode and intent.embedding is None and intent.raw_text:
+            sections = self._split_sections(intent.raw_text)
+            encoding_text = self._build_encoding_text(sections, intent.required_skills, intent.raw_text)
+            intent.embedding = self._encode(encoding_text)
+            
+        return intent
+
     def parse(
         self,
         jd_source: Union[str, Path],

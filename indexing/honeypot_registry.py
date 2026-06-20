@@ -65,7 +65,8 @@ class HoneypotFilter:
         total_duration_years = total_duration_months / 12.0
         return (total_duration_years - config.HONEYPOT_YOE_DISCREPANCY_YEARS) > candidate.years_of_experience
 
-    def run_honeypot_filters(self, candidates: list[CandidateFeatureVector]) -> None:
+    def run_honeypot_filters(self, candidates: list[CandidateFeatureVector], save: bool = True) -> None:
+        honeypot_ids = set()
         for candidate in candidates:
             # Ordered cheapest → most expensive so we short-circuit early:
             # f4: 2 attr lookups (O(1))
@@ -74,13 +75,37 @@ class HoneypotFilter:
             # f2: join + substring scan (O(jobs * text + skills * text))
             if self.__filter4(candidate):
                 candidate.is_honeypot = True
+                honeypot_ids.add(candidate.candidate_id)
                 continue
             if self.__filter3(candidate):
                 candidate.is_honeypot = True
+                honeypot_ids.add(candidate.candidate_id)
                 continue
             if self.__filter5(candidate):
                 candidate.is_honeypot = True
+                honeypot_ids.add(candidate.candidate_id)
                 continue
             # if not self.__filter2(candidate):
             #     candidate.is_honeypot = True
+            #     honeypot_ids.add(candidate.candidate_id)
                 
+        if save:
+            import pickle
+            import logging
+            logger = logging.getLogger(__name__)
+            config.HONEYPOT_SET_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(config.HONEYPOT_SET_PATH, "wb") as f:
+                pickle.dump(honeypot_ids, f)
+            logger.info("Saved %d honeypots to %s", len(honeypot_ids), config.HONEYPOT_SET_PATH)
+
+    @classmethod
+    def load_honeypots(cls) -> set[str]:
+        import pickle
+        import logging
+        logger = logging.getLogger(__name__)
+        if not config.HONEYPOT_SET_PATH.exists():
+            logger.warning("Honeypot index not found at %s. Returning empty set.", config.HONEYPOT_SET_PATH)
+            return set()
+        with open(config.HONEYPOT_SET_PATH, "rb") as f:
+            honeypots = pickle.load(f)
+        return honeypots

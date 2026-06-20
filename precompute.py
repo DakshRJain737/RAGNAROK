@@ -16,15 +16,18 @@ from scoring.skill_match import SkillMatchScorer
 from scoring.composite import CompositeScorer
 from retrieval.rrf_fusion import RRFFusion
 
+import argparse
+from rank import _load_candidates
 
-DATASET_PATH = config.SAMPLE_CANDIDATES_JSON
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", "-i", type=Path, default=config.CANDIDATES_JSONL_GZ if config.CANDIDATES_JSONL_GZ.exists() else config.SAMPLE_CANDIDATES_JSON)
+args = parser.parse_args()
 
 time1 = time.perf_counter()
 
-
-candidate_parser = CandidateParser() 
-candidates = candidate_parser.build_candidate_list(DATASET_PATH)
-print("Candidates loaded successfully")
+DATASET_PATH = args.input
+candidates = _load_candidates(DATASET_PATH)
+print(f"Candidates loaded successfully from {DATASET_PATH}")
 
 honeypot_filter = HoneypotFilter()
 honeypot_filter.run_honeypot_filters(candidates)
@@ -40,6 +43,11 @@ candidates = honeypot_cleanup.cleanup_candidates(candidates)
 trajectory_analyzer = TrajectoryAnalyzer()
 trajectory_analyzer.build_all_feature_vector(candidates)
 print("Trajectory Analyzer run successfully")
+
+from indexing.trajectory_builder import TrajectoryIndex
+trajectory_index = TrajectoryIndex()
+trajectory_index.build(candidates, save=True)
+print("Trajectory Index built successfully")
 
 parser = JDParser()
 intent = parser.parse(config.JD_PATH, encode=True)  # encode=False skips model load
@@ -71,7 +79,6 @@ print("Behavioual Score run successfully")
 
 tscorer = TrajectoryVelocityScorer()
 traj_results = tscorer.score_all(candidates)
-# Then save to config.TRAJECTORY_PATH / TRAJECTORY_IDS_PATH
 sorted_trajectory = sorted(
     traj_results, 
     key=lambda x: x.trajectory_velocity, 

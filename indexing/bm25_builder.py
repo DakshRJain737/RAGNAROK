@@ -28,8 +28,10 @@ def _load_ontology(path: Path) -> dict[str, list[str]]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
+        
+        synonyms = raw.get("synonyms", {})
         ontology = {}
-        for key, val in raw.items():
+        for key, val in synonyms.items():
             if isinstance(val, list):
                 ontology[key.lower().strip()] = [
                     v.lower().strip() for v in val if isinstance(v, str)
@@ -64,39 +66,7 @@ def _expand_query(tokens: list[str]) -> list[str]:
     return expanded
 
 
-def _build_candidate_text(c: CandidateFeatureVector) -> str:
-    parts: list[str] = []
 
-    # Current role — repeated for higher weight in BM25 term frequency
-    parts.append(c.current_title)
-    parts.append(c.current_title)
-    parts.append(c.current_company)
-    parts.append(c.current_industry)
-
-    if c.headline:
-        parts.append(c.headline)
-    if c.summary:
-        parts.append(c.summary)
-
-    # Skills repeated by proficiency so expert skills score higher
-    repeat_map = {"expert": 4, "advanced": 3, "intermediate": 2, "beginner": 1}
-    for skill in c.skills:
-        repeats = repeat_map.get(skill.proficiency, 1)
-        parts.extend([skill.name_raw] * repeats)
-
-    for job in c.career_history:
-        parts.append(job.title)
-        parts.append(job.company)
-        parts.append(job.industry)
-        if job.description:
-            parts.append(job.description)
-
-    for edu in c.education:
-        parts.append(f"{edu.degree} {edu.field_of_study} {edu.institution}")
-
-    parts.append(c.location)
-
-    return " ".join(p for p in parts if p and p.strip())
 
 
 # ── BM25 core ─────────────────────────────────────────────────────────────────
@@ -158,6 +128,17 @@ class _BM25Core:
 
         return scores
 
+    def get_scores(self, query_tokens: list[str]):
+        import numpy as np
+        scores_dict = self.score(query_tokens)
+        arr = np.zeros(self.n, dtype=np.float32)
+        for doc_idx, s in scores_dict.items():
+            arr[doc_idx] = s
+        return arr
+
+    @property
+    def corpus_size(self) -> int:
+        return self.n
 
 # ── Public class ──────────────────────────────────────────────────────────────
 
@@ -184,7 +165,7 @@ class BM25Index:
 
         logger.info("Building BM25 index for %d candidates...", len(candidates))
 
-        corpus = [_tokenize(_build_candidate_text(c)) for c in candidates]
+        corpus = [_tokenize(c.embedding_text) for c in candidates]
         self._id_map = [c.candidate_id for c in candidates]
         self._core = _BM25Core(corpus)
 
@@ -207,8 +188,8 @@ class BM25Index:
             )
         with open(self.index_path, "rb") as f:
             payload = pickle.load(f)
-        self._core = payload["core"]
-        self._id_map = payload["id_map"]
+        self._core = payload["bm25"]
+        self._id_map = payload["candidate_ids"]
         logger.info(
             "Loaded BM25 index: %d candidates from '%s'",
             len(self._id_map), self.index_path,
@@ -259,7 +240,7 @@ class BM25Index:
     def _save(self) -> None:
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.index_path, "wb") as f:
-            pickle.dump({"core": self._core, "id_map": self._id_map}, f)
+            pickle.dump({"bm25": self._core, "candidate_ids": self._id_map, "corpus_size": len(self._id_map)}, f)
         logger.info("Saved BM25 index → %s", self.index_path)
 
     # ── Guards ────────────────────────────────────────────────────────────────
