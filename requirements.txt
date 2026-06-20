@@ -103,6 +103,10 @@ pytest==8.3.5
 # Coverage reporting.
 pytest-cov==6.1.0
 
+# llm specific installs
+llama-cpp-python==0.3.2
+huggingface-hub==0.24.0
+
 # ─────────────────────────────────────────────────────────────────────────────
 # POST-INSTALL STEPS (run once after pip install)
 # ─────────────────────────────────────────────────────────────────────────────
