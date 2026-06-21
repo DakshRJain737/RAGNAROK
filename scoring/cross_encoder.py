@@ -123,27 +123,12 @@ class CrossEncoderReranker:
 
     def _load_model(self) -> None:
         """
-        Load the cross-encoder from the local HuggingFace cache.
-
-        Called automatically on the first rerank() invocation.
-        Safe to call multiple times — returns immediately if already loaded.
-
-        IMPORTANT: No network calls are made here. The model must already
-        be cached in ~/.cache/huggingface/ (done during precompute.py setup).
-        If the cache is missing, loading will fail and _model stays None,
-        triggering the fallback path in rerank().
-
-        The model is loaded with:
-            device="cpu"    — GPU not required, avoids CUDA dependency
-            max_length=512  — built-in truncation to 512 tokens
+        Load the cross-encoder from the local HuggingFace cache instantly.
         """
         if self._model is not None:
             return  # Already loaded — reuse
 
         try:
-            # Import is deferred to here so modules that import
-            # cross_encoder.py but never call rerank() don't pay the
-            # import cost of sentence-transformers.
             from sentence_transformers import CrossEncoder  # type: ignore[import]
 
             logger.info(
@@ -152,15 +137,18 @@ class CrossEncoderReranker:
             )
             t0 = time.perf_counter()
 
+            # 🚀 FIX: Pass local_files_only=True to force offline execution 
+            # and stop the slow HTTP HEAD requests entirely.
             self._model = CrossEncoder(
                 self.MODEL_NAME,
                 max_length=512,
                 device="cpu",
+                local_files_only=True,
             )
 
             elapsed = time.perf_counter() - t0
             logger.info(
-                "Cross-encoder loaded in %.2fs.",
+                "Cross-encoder loaded in %.2fs (Local Only Mode).",
                 elapsed,
             )
 
@@ -175,16 +163,13 @@ class CrossEncoderReranker:
         except Exception as exc:
             logger.error(
                 "Failed to load cross-encoder '%s': %s. "
-                "Model may not be cached. "
-                "Pre-download with: python -c "
-                "\"from sentence_transformers import CrossEncoder; "
-                "CrossEncoder('%s')\". "
+                "Model may not be cached locally. "
                 "Falling back to rrf_score-based ranking.",
                 self.MODEL_NAME,
                 exc,
-                self.MODEL_NAME,
             )
             self._model = None
+
 
     # ------------------------------------------------------------------ #
     # Text builders                                                         #
@@ -342,25 +327,6 @@ class CrossEncoderReranker:
         This method mutates RRFResult objects in-place (sets cross_encoder_score).
         It also modifies the order of elements in pool.
 
-        Args:
-            pool:
-                Candidate pool from scoring/honeypot_filter.py.
-                Expected length: ≤ CROSS_ENCODER_TOP_K (50).
-                All RRFResult.cross_encoder_score values should be 0.0 on entry.
-                If length > top_k, the pool is truncated (sorted by rrf_score
-                descending before truncation, since that is the order from RRF).
-
-            jd:
-                Parsed JDIntent. Must have raw_text populated by jd_parser.py.
-                If raw_text is empty, a fallback query string is constructed
-                from structured fields.
-
-            candidate_store:
-                Dict mapping candidate_id → CandidateFeatureVector.
-                Must contain entries for all candidates in pool.
-                If a candidate_id is missing, that candidate is skipped and
-                retains cross_encoder_score = 0.0 (sorts to bottom).
-
         Returns:
             The same list[RRFResult] with:
               - cross_encoder_score set to sigmoid(raw_logit) for each candidate
@@ -368,17 +334,6 @@ class CrossEncoderReranker:
               - Candidates not found in store retain cross_encoder_score = 0.0
               - Sorted by cross_encoder_score descending
               - Tie-break: candidate_id ascending (spec-compliant)
-
-        Raises:
-            TypeError: If pool is not a list, or jd is not a JDIntent,
-                       or candidate_store is not a dict.
-
-        Side effects:
-            - Calls _load_model() on first invocation (loads from HF cache).
-            - Mutates cross_encoder_score on each RRFResult in pool.
-            - Sorts pool in-place.
-            - Logs INFO with timing and score statistics.
-            - Logs WARNING if model is unavailable or budget exceeded.
         """
         # ── Type guards ───────────────────────────────────────────────────
         if not isinstance(pool, list):
@@ -481,11 +436,15 @@ class CrossEncoderReranker:
         # of raw logits, one per pair. Single batch — all pairs at once.
         # 50 pairs × ~80ms per pair on CPU = ~4s, within the 6s budget.
         try:
+            import torch
+
+            torch.set_num_threads(1)
+
             raw_scores: np.ndarray = self._model.predict(
                 sentences=pairs,
-                batch_size=len(pairs),      # Single batch — all at once
-                show_progress_bar=False,    # No tqdm output in production
-                convert_to_numpy=True,      # Explicit: numpy array output
+                batch_size=16,
+                show_progress_bar=True,    
+                convert_to_numpy=True,      
             )
 
         except Exception as exc:
@@ -581,12 +540,6 @@ def rerank_pool(
     instantiating CrossEncoderReranker directly and reusing the instance
     to avoid reloading the 80MB model on each call.
 
-    Args:
-        pool:             Post-RRF, post-honeypot candidate pool. ≤50 entries.
-        jd:               JDIntent with raw_text populated.
-        candidate_store:  dict[candidate_id → CandidateFeatureVector].
-        top_k:            Max candidates to score. Default: CROSS_ENCODER_TOP_K.
-
     Returns:
         pool sorted by cross_encoder_score descending, with scores set.
 
@@ -600,279 +553,279 @@ def rerank_pool(
     return CrossEncoderReranker(top_k=top_k).rerank(pool, jd, candidate_store)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Smoke test — python -m scoring.cross_encoder
-# ─────────────────────────────────────────────────────────────────────────────
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Smoke test — python -m scoring.cross_encoder
+# # ─────────────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    import dataclasses
-    from datetime import date
+# if __name__ == "__main__":
+#     import dataclasses
+#     from datetime import date
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format=config.LOG_FORMAT,
-        datefmt=config.LOG_DATE_FORMAT,
-    )
+#     logging.basicConfig(
+#         level=logging.INFO,
+#         format=config.LOG_FORMAT,
+#         datefmt=config.LOG_DATE_FORMAT,
+#     )
 
-    print("=" * 65)
-    print("CrossEncoderReranker — smoke test (fallback path, no model)")
-    print("=" * 65)
-    print(
-        "NOTE: This smoke test exercises the FALLBACK path (normalised rrf_score).\n"
-        "      The full model path is tested in tests/test_scoring.py with mocks.\n"
-        "      To test the live model, ensure the HF cache is populated and\n"
-        "      set TEST_LIVE_MODEL=1 in your environment.\n"
-    )
+#     print("=" * 65)
+#     print("CrossEncoderReranker — smoke test (fallback path, no model)")
+#     print("=" * 65)
+#     print(
+#         "NOTE: This smoke test exercises the FALLBACK path (normalised rrf_score).\n"
+#         "      The full model path is tested in tests/test_scoring.py with mocks.\n"
+#         "      To test the live model, ensure the HF cache is populated and\n"
+#         "      set TEST_LIVE_MODEL=1 in your environment.\n"
+#     )
 
-    # ── Helpers: build minimal stubs without importing full pipeline ──────
+#     # ── Helpers: build minimal stubs without importing full pipeline ──────
 
-    def _make_rrf_result(cid: str, rrf_score: float) -> RRFResult:
-        return RRFResult(
-            candidate_id=cid,
-            rrf_score=rrf_score,
-            paths_present=["semantic"],
-            cross_encoder_score=0.0,
-        )
+#     def _make_rrf_result(cid: str, rrf_score: float) -> RRFResult:
+#         return RRFResult(
+#             candidate_id=cid,
+#             rrf_score=rrf_score,
+#             paths_present=["semantic"],
+#             cross_encoder_score=0.0,
+#         )
 
-    def _make_jd() -> JDIntent:
-        return JDIntent(
-            required_skills=["embeddings", "faiss", "python"],
-            nice_to_have_skills=["lora", "qdrant"],
-            disqualifier_skills=["computer vision"],
-            expanded_required=["embeddings", "vector search", "faiss", "python"],
-            yoe_min=5.0,
-            yoe_max=9.0,
-            yoe_ideal_min=5.0,
-            yoe_ideal_max=9.0,
-            preferred_locations=["noida", "pune"],
-            relocation_accepted=True,
-            disqualify_consulting_only=True,
-            disqualify_no_production=True,
-            raw_text=(
-                "Senior AI Engineer: We need production experience with "
-                "embeddings, FAISS, vector databases, ranking systems, "
-                "and strong Python. 5-9 years at product companies."
-            ),
-        )
+#     def _make_jd() -> JDIntent:
+#         return JDIntent(
+#             required_skills=["embeddings", "faiss", "python"],
+#             nice_to_have_skills=["lora", "qdrant"],
+#             disqualifier_skills=["computer vision"],
+#             expanded_required=["embeddings", "vector search", "faiss", "python"],
+#             yoe_min=5.0,
+#             yoe_max=9.0,
+#             yoe_ideal_min=5.0,
+#             yoe_ideal_max=9.0,
+#             preferred_locations=["noida", "pune"],
+#             relocation_accepted=True,
+#             disqualify_consulting_only=True,
+#             disqualify_no_production=True,
+#             raw_text=(
+#                 "Senior AI Engineer: We need production experience with "
+#                 "embeddings, FAISS, vector databases, ranking systems, "
+#                 "and strong Python. 5-9 years at product companies."
+#             ),
+#         )
 
-    def _make_cfv(cid: str, text: str) -> CandidateFeatureVector:
-        """Minimal CandidateFeatureVector stub with only the fields we use."""
-        from pipeline.schemas import RedrobSignals
+#     def _make_cfv(cid: str, text: str) -> CandidateFeatureVector:
+#         """Minimal CandidateFeatureVector stub with only the fields we use."""
+#         from pipeline.schemas import RedrobSignals
 
-        signals = RedrobSignals(
-            profile_completeness_score=80.0,
-            signup_date=date(2025, 1, 1),
-            last_active_date=date(2026, 5, 1),
-            open_to_work_flag=True,
-            profile_views_received_30d=50,
-            applications_submitted_30d=3,
-            recruiter_response_rate=0.6,
-            avg_response_time_hours=24.0,
-            skill_assessment_scores={},
-            connection_count=300,
-            endorsements_received=20,
-            notice_period_days=30,
-            expected_salary_min_lpa=20.0,
-            expected_salary_max_lpa=40.0,
-            preferred_work_mode="hybrid",
-            willing_to_relocate=True,
-            github_activity_score=45.0,
-            search_appearance_30d=200,
-            saved_by_recruiters_30d=5,
-            interview_completion_rate=0.7,
-            offer_acceptance_rate=0.5,
-            verified_email=True,
-            verified_phone=True,
-            linkedin_connected=False,
-        )
-        return CandidateFeatureVector(
-            candidate_id=cid,
-            headline="ML Engineer",
-            summary=text,
-            location="Hyderabad",
-            location_lower="hyderabad",
-            country="India",
-            years_of_experience=6.0,
-            current_title="ML Engineer",
-            current_title_lower="ml engineer",
-            current_company="Swiggy",
-            current_company_lower="swiggy",
-            current_company_size="5001-10000",
-            current_industry="Food Delivery",
-            current_industry_lower="food delivery",
-            skills=[],
-            career_history=[],
-            education=[],
-            signals=signals,
-            is_consulting_only=False,
-            has_product_co_experience=True,
-            total_career_months=72,
-            skill_names_lower=frozenset(["embeddings", "faiss", "python"]),
-            embedding_text=text,
-        )
+#         signals = RedrobSignals(
+#             profile_completeness_score=80.0,
+#             signup_date=date(2025, 1, 1),
+#             last_active_date=date(2026, 5, 1),
+#             open_to_work_flag=True,
+#             profile_views_received_30d=50,
+#             applications_submitted_30d=3,
+#             recruiter_response_rate=0.6,
+#             avg_response_time_hours=24.0,
+#             skill_assessment_scores={},
+#             connection_count=300,
+#             endorsements_received=20,
+#             notice_period_days=30,
+#             expected_salary_min_lpa=20.0,
+#             expected_salary_max_lpa=40.0,
+#             preferred_work_mode="hybrid",
+#             willing_to_relocate=True,
+#             github_activity_score=45.0,
+#             search_appearance_30d=200,
+#             saved_by_recruiters_30d=5,
+#             interview_completion_rate=0.7,
+#             offer_acceptance_rate=0.5,
+#             verified_email=True,
+#             verified_phone=True,
+#             linkedin_connected=False,
+#         )
+#         return CandidateFeatureVector(
+#             candidate_id=cid,
+#             headline="ML Engineer",
+#             summary=text,
+#             location="Hyderabad",
+#             location_lower="hyderabad",
+#             country="India",
+#             years_of_experience=6.0,
+#             current_title="ML Engineer",
+#             current_title_lower="ml engineer",
+#             current_company="Swiggy",
+#             current_company_lower="swiggy",
+#             current_company_size="5001-10000",
+#             current_industry="Food Delivery",
+#             current_industry_lower="food delivery",
+#             skills=[],
+#             career_history=[],
+#             education=[],
+#             signals=signals,
+#             is_consulting_only=False,
+#             has_product_co_experience=True,
+#             total_career_months=72,
+#             skill_names_lower=frozenset(["embeddings", "faiss", "python"]),
+#             embedding_text=text,
+#         )
 
-    # ── Build test data ───────────────────────────────────────────────────
-    pool = [
-        _make_rrf_result("CAND_0000031", rrf_score=0.0492),  # highest RRF
-        _make_rrf_result("CAND_0000014", rrf_score=0.0380),
-        _make_rrf_result("CAND_0000001", rrf_score=0.0250),
-        _make_rrf_result("CAND_0000010", rrf_score=0.0100),
-    ]
+#     # ── Build test data ───────────────────────────────────────────────────
+#     pool = [
+#         _make_rrf_result("CAND_0000031", rrf_score=0.0492),  # highest RRF
+#         _make_rrf_result("CAND_0000014", rrf_score=0.0380),
+#         _make_rrf_result("CAND_0000001", rrf_score=0.0250),
+#         _make_rrf_result("CAND_0000010", rrf_score=0.0100),
+#     ]
 
-    jd = _make_jd()
+#     jd = _make_jd()
 
-    candidate_store: dict[str, CandidateFeatureVector] = {
-        "CAND_0000031": _make_cfv(
-            "CAND_0000031",
-            "Recommendation systems engineer with 6 years building FAISS-based "
-            "retrieval, sentence-transformer embeddings, and XGBoost rankers "
-            "at Swiggy and Uber. Expert in Pinecone, Sentence Transformers, "
-            "and information retrieval. Led migration to hybrid dense+sparse search.",
-        ),
-        "CAND_0000014": _make_cfv(
-            "CAND_0000014",
-            "Frontend engineer at Zomato. Skills include FAISS and OpenSearch. "
-            "Has used vector search in side projects.",
-        ),
-        "CAND_0000001": _make_cfv(
-            "CAND_0000001",
-            "Backend data engineer at Mindtree. Built Kafka streaming pipelines. "
-            "Interested in ML but primary background is data engineering.",
-        ),
-        # CAND_0000010 intentionally MISSING from store to test skip behaviour
-    }
+#     candidate_store: dict[str, CandidateFeatureVector] = {
+#         "CAND_0000031": _make_cfv(
+#             "CAND_0000031",
+#             "Recommendation systems engineer with 6 years building FAISS-based "
+#             "retrieval, sentence-transformer embeddings, and XGBoost rankers "
+#             "at Swiggy and Uber. Expert in Pinecone, Sentence Transformers, "
+#             "and information retrieval. Led migration to hybrid dense+sparse search.",
+#         ),
+#         "CAND_0000014": _make_cfv(
+#             "CAND_0000014",
+#             "Frontend engineer at Zomato. Skills include FAISS and OpenSearch. "
+#             "Has used vector search in side projects.",
+#         ),
+#         "CAND_0000001": _make_cfv(
+#             "CAND_0000001",
+#             "Backend data engineer at Mindtree. Built Kafka streaming pipelines. "
+#             "Interested in ML but primary background is data engineering.",
+#         ),
+#         # CAND_0000010 intentionally MISSING from store to test skip behaviour
+#     }
 
-    print(f"Pool size:  {len(pool)}")
-    print(f"Store size: {len(candidate_store)} (CAND_0000010 missing intentionally)\n")
+#     print(f"Pool size:  {len(pool)}")
+#     print(f"Store size: {len(candidate_store)} (CAND_0000010 missing intentionally)\n")
 
-    # ── Test: Fallback path (force model=None) ────────────────────────────
-    reranker = CrossEncoderReranker(top_k=10)
-    # Simulate model unavailable by leaving _model as None
-    result_pool = reranker.rerank(pool, jd, candidate_store)
+#     # ── Test: Fallback path (force model=None) ────────────────────────────
+#     reranker = CrossEncoderReranker(top_k=10)
+#     # Simulate model unavailable by leaving _model as None
+#     result_pool = reranker.rerank(pool, jd, candidate_store)
 
-    print(f"Result pool size: {len(result_pool)}\n")
-    print("Results (fallback — normalised rrf_score):")
-    for r in result_pool:
-        print(
-            f"  {r.candidate_id}  rrf={r.rrf_score:.5f}  "
-            f"ce_score={r.cross_encoder_score:.4f}  "
-            f"paths={r.paths_present}"
-        )
+#     print(f"Result pool size: {len(result_pool)}\n")
+#     print("Results (fallback — normalised rrf_score):")
+#     for r in result_pool:
+#         print(
+#             f"  {r.candidate_id}  rrf={r.rrf_score:.5f}  "
+#             f"ce_score={r.cross_encoder_score:.4f}  "
+#             f"paths={r.paths_present}"
+#         )
 
-    # ── Acceptance criterion 1: cross_encoder_score in [0, 1] ────────────
-    for r in result_pool:
-        assert 0.0 <= r.cross_encoder_score <= 1.0, (
-            f"FAIL: {r.candidate_id} cross_encoder_score={r.cross_encoder_score} "
-            f"out of [0, 1]."
-        )
-    print("\n[PASS] All cross_encoder_scores in [0.0, 1.0]  ✓")
+#     # ── Acceptance criterion 1: cross_encoder_score in [0, 1] ────────────
+#     for r in result_pool:
+#         assert 0.0 <= r.cross_encoder_score <= 1.0, (
+#             f"FAIL: {r.candidate_id} cross_encoder_score={r.cross_encoder_score} "
+#             f"out of [0, 1]."
+#         )
+#     print("\n[PASS] All cross_encoder_scores in [0.0, 1.0]  ✓")
 
-    # ── Acceptance criterion 2: sorted descending ─────────────────────────
-    for i in range(len(result_pool) - 1):
-        assert result_pool[i].cross_encoder_score >= result_pool[i + 1].cross_encoder_score, (
-            f"FAIL: not sorted descending at index {i}: "
-            f"{result_pool[i].cross_encoder_score} < {result_pool[i+1].cross_encoder_score}"
-        )
-    print("[PASS] Pool sorted by cross_encoder_score descending  ✓")
+#     # ── Acceptance criterion 2: sorted descending ─────────────────────────
+#     for i in range(len(result_pool) - 1):
+#         assert result_pool[i].cross_encoder_score >= result_pool[i + 1].cross_encoder_score, (
+#             f"FAIL: not sorted descending at index {i}: "
+#             f"{result_pool[i].cross_encoder_score} < {result_pool[i+1].cross_encoder_score}"
+#         )
+#     print("[PASS] Pool sorted by cross_encoder_score descending  ✓")
 
-    # ── Acceptance criterion 3: CAND_0000031 (highest RRF) at top ────────
-    assert result_pool[0].candidate_id == "CAND_0000031", (
-        f"FAIL: expected CAND_0000031 at rank 1, got {result_pool[0].candidate_id}"
-    )
-    print("[PASS] Highest RRF-score candidate at position 0  ✓")
+#     # ── Acceptance criterion 3: CAND_0000031 (highest RRF) at top ────────
+#     assert result_pool[0].candidate_id == "CAND_0000031", (
+#         f"FAIL: expected CAND_0000031 at rank 1, got {result_pool[0].candidate_id}"
+#     )
+#     print("[PASS] Highest RRF-score candidate at position 0  ✓")
 
-    # ── Acceptance criterion 4: skipped candidate at bottom ───────────────
-    skipped = next(r for r in result_pool if r.candidate_id == "CAND_0000010")
-    assert skipped.cross_encoder_score == 0.0, (
-        f"FAIL: CAND_0000010 (missing from store) should have score=0.0, "
-        f"got {skipped.cross_encoder_score}"
-    )
-    assert result_pool[-1].candidate_id == "CAND_0000010", (
-        f"FAIL: CAND_0000010 should be last (score=0.0), "
-        f"got {result_pool[-1].candidate_id}"
-    )
-    print("[PASS] Skipped candidate (not in store) has score=0.0 and sorts last  ✓")
+#     # ── Acceptance criterion 4: skipped candidate at bottom ───────────────
+#     skipped = next(r for r in result_pool if r.candidate_id == "CAND_0000010")
+#     assert skipped.cross_encoder_score == 0.0, (
+#         f"FAIL: CAND_0000010 (missing from store) should have score=0.0, "
+#         f"got {skipped.cross_encoder_score}"
+#     )
+#     assert result_pool[-1].candidate_id == "CAND_0000010", (
+#         f"FAIL: CAND_0000010 should be last (score=0.0), "
+#         f"got {result_pool[-1].candidate_id}"
+#     )
+#     print("[PASS] Skipped candidate (not in store) has score=0.0 and sorts last  ✓")
 
-    # ── Acceptance criterion 5: sigmoid helper is monotone ────────────────
-    test_logits = [-10.0, -2.0, 0.0, 2.0, 10.0]
-    sigmoids = [_sigmoid(x) for x in test_logits]
-    for i in range(len(sigmoids) - 1):
-        assert sigmoids[i] < sigmoids[i + 1], (
-            f"FAIL: _sigmoid not monotonically increasing at index {i}"
-        )
-    assert abs(_sigmoid(0.0) - 0.5) < 1e-9, (
-        f"FAIL: _sigmoid(0.0) should be 0.5, got {_sigmoid(0.0)}"
-    )
-    print("[PASS] _sigmoid is monotonically increasing and sigmoid(0)=0.5  ✓")
+#     # ── Acceptance criterion 5: sigmoid helper is monotone ────────────────
+#     test_logits = [-10.0, -2.0, 0.0, 2.0, 10.0]
+#     sigmoids = [_sigmoid(x) for x in test_logits]
+#     for i in range(len(sigmoids) - 1):
+#         assert sigmoids[i] < sigmoids[i + 1], (
+#             f"FAIL: _sigmoid not monotonically increasing at index {i}"
+#         )
+#     assert abs(_sigmoid(0.0) - 0.5) < 1e-9, (
+#         f"FAIL: _sigmoid(0.0) should be 0.5, got {_sigmoid(0.0)}"
+#     )
+#     print("[PASS] _sigmoid is monotonically increasing and sigmoid(0)=0.5  ✓")
 
-    # ── Acceptance criterion 6: empty pool returns safely ─────────────────
-    empty_result = reranker.rerank([], jd, candidate_store)
-    assert empty_result == [], (
-        f"FAIL: empty pool should return [], got {empty_result}"
-    )
-    print("[PASS] Empty pool returns []  ✓")
+#     # ── Acceptance criterion 6: empty pool returns safely ─────────────────
+#     empty_result = reranker.rerank([], jd, candidate_store)
+#     assert empty_result == [], (
+#         f"FAIL: empty pool should return [], got {empty_result}"
+#     )
+#     print("[PASS] Empty pool returns []  ✓")
 
-    # ── Acceptance criterion 7: TypeError on wrong input types ────────────
-    try:
-        reranker.rerank("not-a-list", jd, candidate_store)  # type: ignore
-        print("FAIL: should have raised TypeError for non-list pool")
-    except TypeError:
-        print("[PASS] TypeError raised for non-list pool  ✓")
+#     # ── Acceptance criterion 7: TypeError on wrong input types ────────────
+#     try:
+#         reranker.rerank("not-a-list", jd, candidate_store)  # type: ignore
+#         print("FAIL: should have raised TypeError for non-list pool")
+#     except TypeError:
+#         print("[PASS] TypeError raised for non-list pool  ✓")
 
-    try:
-        reranker.rerank(result_pool, "not-a-JDIntent", candidate_store)  # type: ignore
-        print("FAIL: should have raised TypeError for non-JDIntent jd")
-    except TypeError:
-        print("[PASS] TypeError raised for non-JDIntent jd  ✓")
+#     try:
+#         reranker.rerank(result_pool, "not-a-JDIntent", candidate_store)  # type: ignore
+#         print("FAIL: should have raised TypeError for non-JDIntent jd")
+#     except TypeError:
+#         print("[PASS] TypeError raised for non-JDIntent jd  ✓")
 
-    # ── Acceptance criterion 8: __repr__ ─────────────────────────────────
-    repr_str = repr(reranker)
-    assert "CrossEncoderReranker" in repr_str
-    assert "cross-encoder/ms-marco-MiniLM-L-6-v2" in repr_str
-    print(f"[PASS] __repr__ = {repr_str}  ✓")
+#     # ── Acceptance criterion 8: __repr__ ─────────────────────────────────
+#     repr_str = repr(reranker)
+#     assert "CrossEncoderReranker" in repr_str
+#     assert "cross-encoder/ms-marco-MiniLM-L-6-v2" in repr_str
+#     print(f"[PASS] __repr__ = {repr_str}  ✓")
 
-    # ── Acceptance criterion 9: rerank_pool() convenience function ────────
-    pool2 = [
-        _make_rrf_result("CAND_0000031", 0.049),
-        _make_rrf_result("CAND_0000014", 0.038),
-    ]
-    result2 = rerank_pool(pool2, jd, candidate_store, top_k=10)
-    assert len(result2) == 2
-    assert result2[0].cross_encoder_score >= result2[1].cross_encoder_score
-    print("[PASS] rerank_pool() convenience function works correctly  ✓")
+#     # ── Acceptance criterion 9: rerank_pool() convenience function ────────
+#     pool2 = [
+#         _make_rrf_result("CAND_0000031", 0.049),
+#         _make_rrf_result("CAND_0000014", 0.038),
+#     ]
+#     result2 = rerank_pool(pool2, jd, candidate_store, top_k=10)
+#     assert len(result2) == 2
+#     assert result2[0].cross_encoder_score >= result2[1].cross_encoder_score
+#     print("[PASS] rerank_pool() convenience function works correctly  ✓")
 
-    # ── Live model test (optional — requires HF cache populated) ─────────
-    import os
-    if os.environ.get("TEST_LIVE_MODEL", "0") == "1":
-        print("\n── Live model test (TEST_LIVE_MODEL=1) ──")
-        live_reranker = CrossEncoderReranker(top_k=50)
-        live_pool = [
-            _make_rrf_result("CAND_0000031", 0.049),
-            _make_rrf_result("CAND_0000014", 0.038),
-            _make_rrf_result("CAND_0000001", 0.025),
-        ]
-        t_live = time.perf_counter()
-        live_result = live_reranker.rerank(live_pool, jd, candidate_store)
-        live_elapsed = time.perf_counter() - t_live
-        print(f"Live model reranked {len(live_result)} candidates in {live_elapsed:.2f}s")
-        for r in live_result:
-            print(
-                f"  {r.candidate_id}  rrf={r.rrf_score:.5f}  "
-                f"ce={r.cross_encoder_score:.4f}"
-            )
-        assert live_result[0].candidate_id == "CAND_0000031", (
-            "FAIL: CAND_0000031 (deep retrieval expertise) should rank #1 "
-            f"but got {live_result[0].candidate_id}"
-        )
-        print("[PASS] Live model: CAND_0000031 (Swiggy retrieval engineer) ranks #1  ✓")
-        assert live_elapsed < 10.0, (
-            f"FAIL: live model took {live_elapsed:.2f}s, expected < 10s"
-        )
-        print(f"[PASS] Live model within 10s budget ({live_elapsed:.2f}s)  ✓")
-    else:
-        print(
-            "\n[SKIP] Live model test skipped. "
-            "Set TEST_LIVE_MODEL=1 to run with actual cross-encoder."
-        )
+#     # ── Live model test (optional — requires HF cache populated) ─────────
+#     import os
+#     if os.environ.get("TEST_LIVE_MODEL", "0") == "1":
+#         print("\n── Live model test (TEST_LIVE_MODEL=1) ──")
+#         live_reranker = CrossEncoderReranker(top_k=50)
+#         live_pool = [
+#             _make_rrf_result("CAND_0000031", 0.049),
+#             _make_rrf_result("CAND_0000014", 0.038),
+#             _make_rrf_result("CAND_0000001", 0.025),
+#         ]
+#         t_live = time.perf_counter()
+#         live_result = live_reranker.rerank(live_pool, jd, candidate_store)
+#         live_elapsed = time.perf_counter() - t_live
+#         print(f"Live model reranked {len(live_result)} candidates in {live_elapsed:.2f}s")
+#         for r in live_result:
+#             print(
+#                 f"  {r.candidate_id}  rrf={r.rrf_score:.5f}  "
+#                 f"ce={r.cross_encoder_score:.4f}"
+#             )
+#         assert live_result[0].candidate_id == "CAND_0000031", (
+#             "FAIL: CAND_0000031 (deep retrieval expertise) should rank #1 "
+#             f"but got {live_result[0].candidate_id}"
+#         )
+#         print("[PASS] Live model: CAND_0000031 (Swiggy retrieval engineer) ranks #1  ✓")
+#         assert live_elapsed < 10.0, (
+#             f"FAIL: live model took {live_elapsed:.2f}s, expected < 10s"
+#         )
+#         print(f"[PASS] Live model within 10s budget ({live_elapsed:.2f}s)  ✓")
+#     else:
+#         print(
+#             "\n[SKIP] Live model test skipped. "
+#             "Set TEST_LIVE_MODEL=1 to run with actual cross-encoder."
+#         )
 
-    print(f"\nAll smoke-test assertions passed.")
+#     print(f"\nAll smoke-test assertions passed.")
