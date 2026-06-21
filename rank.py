@@ -71,51 +71,79 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+import io
+import gzip
+import json
+import logging
+import sys
+from pathlib import Path
+import orjson  # pip install orjson
+
+logger = logging.getLogger(__name__)
+
 def _load_candidates(input_path: Path) -> list:
-    """Load and parse candidates from a .jsonl, .jsonl.gz, or .json file."""
+    """Load and parse candidates efficiently using streaming and orjson."""
     logger.info("Loading candidates from %s", input_path)
     if not input_path.exists():
         logger.error("Input file not found: %s", input_path)
         sys.exit(1)
-
-    raw = input_path.read_bytes()
-    if input_path.suffix == ".gz":
-        raw = gzip.decompress(raw)
-    text = raw.decode("utf-8", errors="ignore")
 
     from pipeline.candidate_parser import CandidateParser
     parser = CandidateParser()
     candidates = []
     errors = 0
 
-    stripped = text.strip()
-    if stripped.startswith("["):
-        # JSON array
-        try:
-            arr = json.loads(stripped)
-            for item in arr:
+    # 1. Open the file as a stream (handles .gz seamlessly without full decompression in RAM)
+    base_file = open(input_path, "rb")
+    file_stream = gzip.open(base_file, "rb") if input_path.suffix == ".gz" else base_file
+
+    try:
+        # 2. Peak at the first non-empty byte to detect JSON vs JSONL
+        first_byte = b""
+        for chunk in iter(lambda: file_stream.read(1), b""):
+            if chunk.strip():
+                first_byte = chunk
+                break
+        
+        # 3. Parse based on format
+        if first_byte == b"[":
+            # Standard JSON Array: Use orjson on the remaining full read (orjson handles bytes directly)
+            try:
+                full_bytes = first_byte + file_stream.read()
+                arr = orjson.loads(full_bytes)
+                for item in arr:
+                    try:
+                        candidates.append(parser.parse_candidate(item))
+                    except Exception as e:
+                        errors += 1
+                        logger.debug("Parse error: %s", e)
+            except orjson.JSONDecodeError as e:
+                logger.error("JSON parse error: %s", e)
+                sys.exit(1)
+        else:
+            # JSONL: Process line-by-line as a true stream
+            # Put the first byte back so the first line is complete
+            buffered_stream = io.BufferedReader(file_stream)
+            
+            for line_no, line in enumerate(buffered_stream, start=1):
+                line = line.strip()
+                if not line:
+                    continue
                 try:
-                    candidates.append(parser.parse_candidate(item))
+                    # orjson.loads() accepts raw bytes directly—no .decode("utf-8") needed!
+                    candidates.append(parser.parse_candidate(orjson.loads(line)))
                 except Exception as e:
                     errors += 1
-                    logger.debug("Parse error: %s", e)
-        except json.JSONDecodeError as e:
-            logger.error("JSON parse error: %s", e)
-            sys.exit(1)
-    else:
-        # JSONL
-        for line_no, line in enumerate(stripped.splitlines(), start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                candidates.append(parser.parse_candidate(json.loads(line)))
-            except Exception as e:
-                errors += 1
-                logger.debug("Line %d parse error: %s", line_no, e)
+                    logger.debug("Line %d parse error: %s", line_no, e)
+
+    finally:
+        file_stream.close()
+        if input_path.suffix == ".gz":
+            base_file.close()
 
     logger.info("Loaded %d candidates (%d parse errors)", len(candidates), errors)
     return candidates
+
 
 
 def _load_jd(jd_path: Path | None):
