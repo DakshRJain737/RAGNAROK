@@ -1,36 +1,3 @@
-"""
-scoring/behavioral.py — Behavioral signal scoring.
-
-Turns the 23 `redrob_signals` fields on a CandidateFeatureVector into the
-behavioral-facing fields of ComponentScores:
-
-    behavioral_score      0-1, weighted per config.BEHAVIORAL_WEIGHTS
-    recency_score         0-1, exp(-RECENCY_LAMBDA * days_since_active)
-    notice_period_score   0-1, tiered notice-period fitness
-    uncertainty_penalty   0.7-1.0, profile-sparsity confidence multiplier
-    signal_count          0-9, how many "extra" signal types are populated
-
-Sub-score formulas are kept identical to indexing/feature_store.py
-(FeatureStore._to_vector dims [0], [3], [4], [5], [6], [1], [2]) so the
-feature matrix and the composite-scoring breakdown never disagree about
-what "recency" or "notice period" means for a given candidate.
-
-Usage:
-    scorer = BehavioralScorer()
-    result = scorer.score(candidate)            # -> BehavioralResult
-    results = scorer.score_all(candidates)      # -> dict[candidate_id, BehavioralResult]
-
-Consumed by scoring/composite.py to populate ComponentScores.{behavioral_score,
-recency_score, notice_period_score, uncertainty_penalty, signal_count}.
-
-Dependencies:
-  - config.py            (weights, thresholds, defaults)
-  - pipeline/schemas.py   (CandidateFeatureVector, RedrobSignals)
-
-No I/O. No network. Stateless — a single BehavioralScorer instance is safe
-to share across threads / reuse across the whole candidate pool.
-"""
-
 from __future__ import annotations
 
 import logging

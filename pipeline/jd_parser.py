@@ -1,28 +1,3 @@
-"""
-pipeline/jd_parser.py
----------------------
-Converts raw job-description text (or a .md / .txt file) into a structured
-JDIntent consumed by every downstream component.
-
-Parsing pipeline
-  1. Load + clean text  (strip markdown bold/italic, normalise dashes)
-  2. Split into named sections  (required / nice_to_have / disqualifiers)
-  3. Vocabulary scan each section for skills present in skill_map.json
-  4. Supplement with spaCy noun-phrase extraction (optional — degrades gracefully)
-  5. Extract YOE bounds, preferred locations, boolean flags
-  6. Expand required skills via QueryExpander → JDIntent.expanded_required
-  7. Encode focused text with MiniLM → JDIntent.embedding  (lazy-loaded model)
-
-Confirmed against the actual job_description for this hackathon:
-  - Section headers  : "## Things you absolutely need"
-                       "## Things we'd like you to have but won't reject you for"
-                       "## Things we explicitly do NOT want"
-  - YOE string       : "5-9 years"  (en-dash U+2013)
-  - Consulting disq. : "People who have only worked at consulting firms
-                        (TCS, Infosys, Wipro, Accenture, Cognizant, Capgemini, …)"
-  - Locations        : Pune, Noida, Delhi NCR, Hyderabad, Mumbai
-"""
-
 from __future__ import annotations
 
 import json

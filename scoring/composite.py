@@ -1,37 +1,3 @@
-"""
-scoring/composite.py
---------------------
-Fuses skill-match, career-quality, behavioral, and cross-encoder signals
-into a single ranked list of candidates.
-
-Pipeline position (runner.py):
-    retrieval paths
-        └─► rrf_fusion.py            → list[RRFResult]  (≤60, ce_score=0.0)
-        └─► honeypot_filter.py       → list[RRFResult]  (≤50, honeypots removed from RRF pool)
-        └─► cross_encoder.py         → list[RRFResult]  (≤50, cross_encoder_score populated)
-        └─► composite.py  ◄── HERE   → list[ComponentScores] (final ranked output)
-
-The pool passed to rank() MUST already have cross_encoder_score populated
-by cross_encoder.py. composite.py does not call the cross-encoder itself.
-
-Weights (from config.py):
-    WEIGHT_SKILL=0.40, WEIGHT_CAREER=0.35, WEIGHT_BEHAVIORAL=0.25
-
-Cross-encoder blend factor (CE_BLEND_FACTOR=0.30):
-    blended = (1 - CE_BLEND) × weighted_sum + CE_BLEND × ce_score
-
-Post-blend adjustments (in order):
-    1. Location bonus  (additive, from config.PREFERRED_LOCATIONS)
-    2. Uncertainty penalty (multiplicative, from BehavioralResult — NOT recomputed here)
-    3. Hard overrides: hard_disqualifier or is_honeypot → score = 0.0
-
-ComponentScores here is the LOCAL dataclass (slots=True, full transparency
-record). It is distinct from pipeline/schemas.py ComponentScores (which is
-the sub-score breakdown used by the trust layer). runner.py should use
-THIS module's ComponentScores for the final ranked list and schemas.py's
-ComponentScores for the trust/reasoning layer.
-"""
-
 from __future__ import annotations
 
 import logging

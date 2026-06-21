@@ -1,39 +1,3 @@
-"""
-skill_match.py
-
-Hierarchical capability-cluster skill scorer.
-
-Architecture (unchanged from v3 concept):
-    Capabilities → clusters → final score.
-
-Bugs fixed vs the v3 draft:
-    1.  Score scale: _score_capability() now normalises by the number of
-        unique skills that COULD have matched in that capability set, so a
-        single strong match in a small capability (e.g. "python") yields a
-        high sub-score rather than ~0.18 after exp().  The exp-saturation
-        approach is replaced with a direct weighted-coverage model.
-
-    2.  Final formula normalised: REQUIRED_SKILL_WEIGHT / (REQ + NICE) so
-        the output stays in [0, 1] regardless of the raw weight values.
-
-    3.  _check_disqualifiers() implemented (was a stub returning False).
-
-    4.  Capability tree expanded:
-        - production_ml cluster added (production ML / LLM systems signal
-          that the JD cares about — "people who understood retrieval and
-          ranking before it became fashionable").
-        - llm_systems cluster added (fine-tuning, prompt engineering — the
-          nice-to-have side of the JD).
-        - All skill aliases normalised to lowercase (matching pipeline data).
-
-    5.  score_all() signature changed to match composite.py contract:
-        score_all(candidates, jd) → dict[str, SkillMatchResult]
-        (was list; dict keyed by candidate_id is required by CompositeScorer).
-
-    6.  Module singleton _SCORER kept; score_skill_match() convenience
-        function updated to match.
-"""
-
 from __future__ import annotations
 
 import logging

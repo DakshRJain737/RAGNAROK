@@ -1,25 +1,3 @@
-"""
-pipeline/runner.py — End-to-end pipeline orchestrator for RAGnarok.
-
-Runs all ranking stages in order and returns a list of RankedCandidate objects.
-
-Stage order:
-    1. Load pre-built indexes (FAISS, BM25, feature store, trajectory, honeypot)
-    2. Encode JD query via bi-encoder
-    3. Run 5 retrieval paths in parallel
-    4. RRF fusion → top-60 pool
-    5. Honeypot filter → top-50
-    6. Cross-encoder rerank
-    7. Composite scoring (0.40×skill + 0.35×career + 0.25×behavioral)
-    8. Trust layer (Advocate + Skeptic + Verdict)
-    9. Reasoning generation
-    10. Assemble RankedCandidate list
-
-Called by:
-    api/routes/rank.py  →  PipelineRunner(jd, candidates).run(top_k)
-    rank.py             →  direct CLI invocation
-"""
-
 from __future__ import annotations
 
 import logging

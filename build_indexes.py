@@ -1,27 +1,3 @@
-"""
-build_indexes.py — Precompute all search indexes from the full candidates.jsonl dataset.
-
-Run once (offline) before ranking. Outputs:
-  data/indexes/faiss.index          — IVF256 dense vector index
-  data/indexes/candidate_ids.npy    — FAISS id map
-  data/indexes/bm25.pkl             — BM25 inverted index
-  data/indexes/features.npy         — 30-dim feature matrix
-  data/indexes/feature_ids.npy      — FeatureStore id map
-  data/indexes/trajectory.npy       — trajectory vectors
-  data/indexes/trajectory_ids.npy   — trajectory id map
-  data/indexes/honeypots.pkl        — honeypot candidate set
-
-Usage:
-    .venv\\Scripts\\python.exe build_indexes.py
-
-Timing (approximate on CPU):
-  - Parsing 100K JSONL records  :  ~30s
-  - Honeypot filter              :  ~5s
-  - FAISS encoding (MiniLM-L6)  :  20–60 min
-  - BM25 build                   :  ~30s
-  - FeatureStore build           :  ~10s
-"""
-
 from __future__ import annotations
 
 import logging

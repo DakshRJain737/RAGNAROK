@@ -1,30 +1,3 @@
-"""
-ontology/query_expander.py
---------------------------
-Expands JD skill terms into richer BM25 query tokens using skill_map.json.
-
-Responsibilities:
-  1. Load synonyms, co-skills, and domain-transfer sections from skill_map.json.
-  2. Given a list of required skills (from JDIntent), return an expanded set
-     that includes synonyms and co-occurring skills.
-  3. Tokenise the expanded set for BM25Okapi.get_scores() consumption.
-  4. Build a reverse domain-transfer index so that JD target skills can find
-     source domains (e.g. "information retrieval" ← "recommendation systems").
-
-Consumed by:
-  - pipeline/jd_parser.py       → populates JDIntent.expanded_required
-  - retrieval/keyword_path.py   → builds BM25 query via build_query_tokens()
-
-Does NOT handle domain-transfer BFS graph walking — that is graph_traversal.py.
-
-Dependencies:
-  - config.py          (SKILL_MAP_PATH)
-  - ontology/skill_map.json  (data file)
-  - stdlib: json, logging, pathlib, typing
-
-No ML imports. No network calls. Safe to load during the 5-min ranking window.
-"""
-
 from __future__ import annotations
 
 import json

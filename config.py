@@ -1,13 +1,3 @@
-"""
-config.py — Central configuration for the Redrob Candidate Ranking System.
-
-All tunable constants, file paths, model names, scoring weights, and
-business-rule parameters live here. Import this module everywhere;
-never hardcode values in other files.
-
-No side-effects on import. Zero dependencies on our own codebase.
-"""
-
 from pathlib import Path
 
 # ─────────────────────────────────────────────────────────────────────────────

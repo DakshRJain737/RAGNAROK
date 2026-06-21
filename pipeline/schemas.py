@@ -1,23 +1,3 @@
-"""
-pipeline/schemas.py — Shared data contracts for the Redrob ranking pipeline.
-
-This file is the interface agreement between Dev A (retrieval/trust) and
-Dev B (scoring/indexing). Every dataclass here is immutable once agreed upon.
-Changing a field requires both teammates to review the impact.
-
-Rules:
-  - All dataclasses use __slots__ for memory efficiency at 100K scale.
-  - All fields are type-annotated.
-  - All containers use frozen=False for incremental construction during pipeline.
-  - Validation helpers are provided as classmethods / standalone functions.
-
-No I/O. No network. No side-effects. Pure data containers + validation.
-
-Dependencies:
-  - config.py  (weight sum validation, pattern constants)
-  - stdlib only (dataclasses, typing, datetime, re)
-"""
-
 from __future__ import annotations
 
 import re

@@ -1,17 +1,3 @@
-"""
-scoring/honeypot_filter.py
---------------------------
-Post-RRF honeypot removal wrapper.
-
-HoneypotCleanup is an O(N) pass that removes candidates whose is_honeypot
-flag was set to True during pre-computation by indexing/honeypot_registry.py.
-
-At ranking time this is a simple list comprehension — all expensive detection
-logic runs offline in precompute.py. This keeps the ranking pipeline fast.
-
-Consumed by: pipeline/runner.py (stage 6 of 13)
-"""
-
 from __future__ import annotations
 
 import logging

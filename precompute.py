@@ -125,48 +125,5 @@ for r in sms_results.values():
         )
 print("Skill Match Scorer run successfully")
 
-# rrf_fusion = RRFFusion()
-# rrf_fusion.fuse()
-
-# composite_scorer = CompositeScorer(intent,candidates, bscorer)
-# ranked = composite_scorer.rank()
- 
-# print(f"Ranked {len(ranked)} candidates:\n")
-# for rank_pos, r in enumerate(ranked, start=1):
-#     print(
-#         f"  #{rank_pos}  {r.candidate_id:<20} "
-#         f"final={r.final_score:.4f}  "
-#         f"ce={r.cross_encoder_score:.3f}  "
-#         f"skill={r.skill_match_score:.3f}  "
-#         f"career={r.career_quality_score:.3f}  "
-#         f"loc_bonus={r.location_bonus_applied}  "
-#         f"uncertainty={r.uncertainty_penalty_applied}  "
-#         f"hard_disq={r.hard_disqualifier}  "
-#         f"honeypot={r.honeypot_override}"
-    # )
-
-# How to run the LLM
-# if config.LLM_RERANKER_ENABLED:
-#             try:
-#                 from scoring.llm_reranker import LLMReranker
-#                 llm = LLMReranker()
-#                 rrf_pool = llm.score_pool(
-#                     rrf_pool,
-#                     self._jd,
-#                     self._candidate_store,
-#                     top_n=config.LLM_TOP_N,
-#                 )
-#             except Exception as e:
-#                 logger.warning("LLM reranker unavailable: %s — skipping", e)
-#                 # Set neutral scores so composite.py blend factor doesn't explode
-#                 for r in rrf_pool:
-#                     if not hasattr(r, "llm_score"):
-#                         r.llm_score = 0.5
-#         else:
-#             logger.info("LLM reranker disabled (LLM_RERANKER_ENABLED=False)")
-#             for r in rrf_pool:
-#                 r.llm_score = 0.5
-#         timings["llm_reranker"] = (time.perf_counter() - t0) * 1000
-
 time2 = time.perf_counter()
 print(time2 - time1)
