@@ -141,8 +141,6 @@ class CareerQualityScorer:
         if total_months == 0:
             return 1.0
 
-        # Penalty-only: pure out-of-domain exposure reduces score from 1.0 baseline.
-        # Does not overlap with _product_co_score (which measures product-co time).
         penalty_months = sum(
             j.duration_months for j in history
             if j.industry_lower in _DOMAIN_PENALTY_INDUSTRIES
@@ -150,8 +148,6 @@ class CareerQualityScorer:
         if penalty_months == 0:
             return 1.0
 
-        # Weight recent penalty jobs more heavily than old ones.
-        # Sort ascending by start_date so index 0 = oldest.
         sorted_history = sorted(history, key=lambda j: j.start_date)
         n = len(sorted_history)
         weighted_penalty = 0.0
