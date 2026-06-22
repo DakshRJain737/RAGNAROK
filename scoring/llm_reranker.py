@@ -19,6 +19,8 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Optional
+from pipeline.schemas import JDIntent, CandidateFeatureVector
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -43,94 +45,124 @@ class LLMScoredResult:
         if self.paths_present is None:
             self.paths_present = []
 
+# Prompt
+def build_jd_summary(jd: JDIntent) -> str:
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Prompt builders — edit these to match your CandidateFeatureVector fields
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_jd_summary(jd) -> str:
-    """
-    Condense JDIntent → ~80 token string for the prompt.
-    Edit field names to match your pipeline/schemas.py JDIntent class.
-    """
-    # ── Pull required skills ──────────────────────────────────────────────────
     try:
-        req_skills = ", ".join(list(jd.required_skills)[:5])
+        req_skills = ", ".join(jd.required_skills)
+        nice_to_have_skills = ", ".join(jd.nice_to_have_skills)
     except Exception:
         req_skills = "embeddings, retrieval, ranking, Python"
-
-    # ── Pull seniority / location hints ──────────────────────────────────────
-    try:
-        yoe = f"{jd.yoe_min:.0f}-{jd.yoe_max:.0f}y"
-    except Exception:
-        yoe = "5-9y"
+        nice_to_have_skills = "None"
 
     try:
-        location = jd.preferred_locations[0] if jd.preferred_locations else "Pune/Noida"
+        yoe = (
+            f"Required Experience: {jd.yoe_min}-{jd.yoe_max} years. "
+            f"Ideal Experience: {jd.yoe_ideal_min}-{jd.yoe_ideal_max} years."
+        )
     except Exception:
-        location = "Pune/Noida"
+        yoe = "Required Experience: 5-9 years."
+
+    try:
+        location = ", ".join(jd.preferred_locations)
+
+        if jd.relocation_accepted is False:
+            relocation_info = "Relocation is not accepted."
+        elif jd.relocation_accepted is True:
+            relocation_info = "Relocation is accepted."
+        else:
+            relocation_info = "Relocation preference not specified."
+
+    except Exception:
+        location = "Pune, Noida"
+        relocation_info = "Relocation preference not specified."
 
     return (
-        f"Role: Senior AI Engineer · Experience: {yoe} · Location: {location} · "
-        f"Must have: {req_skills} · "
-        f"No consulting-only backgrounds (TCS/Wipro/Infosys etc.) · "
-        f"Product-company experience required"
+        f"Role: Senior AI Engineer\n"
+        f"{yoe}\n"
+        f"Preferred Locations: {location}\n"
+        f"{relocation_info}\n"
+        f"Required Skills: {req_skills}\n"
+        f"Nice-to-have Skills: {nice_to_have_skills}\n"
+        f"Candidates with consulting-only backgrounds should receive lower scores.\n"
+        f"Candidates with product-company experience should receive higher scores."
     )
 
-
-def build_candidate_summary(cfv) -> str:
-    """
-    Condense CandidateFeatureVector → ~100 token string for the prompt.
-    Edit field names to match your pipeline/schemas.py CandidateFeatureVector class.
-    """
-    # ── Skills ────────────────────────────────────────────────────────────────
+# Cabdidate Summary
+def build_candidate_summary(cfv: CandidateFeatureVector) -> str:
     try:
-        # Adjust: cfv.skills may be a list of dicts or list of strings
-        if cfv.skills and isinstance(cfv.skills[0], dict):
-            skills = ", ".join(s.get("name", "") for s in cfv.skills[:6])
-        else:
-            skills = ", ".join(str(s) for s in cfv.skills[:6])
-    except Exception:
-        skills = "unknown"
+        skills = []
+        for s in sorted(
+            cfv.skills,
+            key=lambda x: (x.assessment_score, x.endorsements),
+            reverse=True
+        )[:]:
+            skill_str = f"{s.name_raw} ({s.proficiency}"
+            if s.assessment_score >= 0:
+                skill_str += f", score={s.assessment_score:.0f}"
+            skill_str += ")"
+            skills.append(skill_str)
 
-    # ── Experience & career ───────────────────────────────────────────────────
-    try:
-        yoe = f"{cfv.years_of_experience:.0f}y"
+        skills_str = ", ".join(skills)
     except Exception:
-        yoe = "?"
+        skills_str = "Unknown"
 
-    try:
-        title = cfv.current_title or "Unknown"
-    except Exception:
-        title = "Unknown"
+    title = cfv.current_title or "Unknown"
+    company = cfv.current_company or "Unknown"
+    yoe = f"{cfv.years_of_experience:.1f} years"
 
     try:
-        company = cfv.current_company or "Unknown"
+        roles = []
+        for role in cfv.career_history[:]:
+            roles.append(
+                f"{role.title} at {role.company} ({role.duration_months} months)"
+            )
+        career_summary = "; ".join(roles)
     except Exception:
-        company = "Unknown"
-
-    # ── Flags ─────────────────────────────────────────────────────────────────
-    try:
-        product_co = "yes" if cfv.has_product_co_experience else "no"
-    except Exception:
-        product_co = "unknown"
-
-    try:
-        consulting_only = "yes" if cfv.is_consulting_only else "no"
-    except Exception:
-        consulting_only = "unknown"
+        career_summary = "Unknown"
 
     try:
-        active_days = cfv.days_since_active if hasattr(cfv, "days_since_active") else "?"
-        activity = f"{active_days}d ago"
+        education_summary = ", ".join(
+            f"{e.degree} in {e.field_of_study} from {e.institution}"
+            for e in cfv.education[:2]
+        )
     except Exception:
-        activity = "unknown"
+        education_summary = "Unknown"
+
+    try:
+        signals = cfv.signals
+
+        github = "Yes" if signals.has_github else "No"
+        open_to_work = "Yes" if signals.open_to_work_flag else "No"
+
+        activity = f"{signals.days_since_active} days ago"
+
+        notice_period = f"{signals.notice_period_days} days"
+
+    except Exception:
+        github = "Unknown"
+        open_to_work = "Unknown"
+        activity = "Unknown"
+        notice_period = "Unknown"
+
+    product_exp = "Yes" if cfv.has_product_co_experience else "No"
+    consulting_only = "Yes" if cfv.is_consulting_only else "No"
 
     return (
-        f"{yoe} exp · {title} at {company} · "
-        f"Skills: {skills} · "
-        f"Product-co: {product_co} · Consulting-only: {consulting_only} · "
-        f"Last active: {activity}"
+        f"Experience: {yoe}\n"
+        f"Current Role: {title} at {company}\n"
+        f"Location: {cfv.location}\n"
+        f"Product Company Experience: {product_exp}\n"
+        f"Consulting Only Background: {consulting_only}\n"
+        f"Open To Work: {open_to_work}\n"
+        f"Last Active: {activity}\n"
+        f"Notice Period: {notice_period}\n"
+        f"GitHub Linked: {github}\n"
+        f"Top Skills: {skills_str}\n"
+        f"Recent Career History: {career_summary}\n"
+        f"Education: {education_summary}\n"
+        f"Headline: {cfv.headline}\n"
+        f"Summary: {cfv.summary[:300]}"
     )
 
 
@@ -138,15 +170,42 @@ def build_candidate_summary(cfv) -> str:
 # Prompt template — single structured scoring prompt
 # ─────────────────────────────────────────────────────────────────────────────
 
+SYSTEM_PROMPT = """
+You are an expert technical recruiter evaluating candidates for a Senior AI Engineer role at an early-stage Series A startup.
+
+Important principles:
+
+- Prioritize evidence over keywords.
+- Prefer production ML systems experience.
+- Prefer retrieval, ranking, recommendation and search systems.
+- Prefer product-company experience.
+- Prefer ownership and execution.
+- Active candidates are better.
+- Consulting-only careers are negative signals.
+- Pure research backgrounds are negative signals.
+- Do not overvalue trendy frameworks.
+
+Scoring:
+
+9-10 = Exceptional fit
+7-9 = Strong fit
+5-7 = Moderate fit
+3-5 = Weak fit
+0-3 = Poor fit
+
+Return ONLY a number and reason why not full score or why suchb low score
+"""
+
 SCORING_PROMPT_TEMPLATE = """\
-You are a senior technical recruiter scoring a candidate for a job.
-Score from 0 to 10. Reply with ONLY a single integer or decimal number. Nothing else.
+JOB DESCRIPTION
 
-JOB: {jd_summary}
+{jd_summary}
 
-CANDIDATE: {candidate_summary}
+CANDIDATE
 
-SCORE (0-10):"""
+{candidate_summary}
+
+Score:"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,170 +213,176 @@ SCORE (0-10):"""
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LLMReranker:
-    """
-    Local LLM scorer using llama-cpp-python with a Q4 GGUF model.
-
-    Instantiate once per pipeline run (model load is expensive).
-    Call score_pool() to batch-score a list of RRF results.
-
-    Args:
-        model_path: Path to .gguf file. Defaults to config.LLM_MODEL_PATH.
-        n_threads:  CPU threads for inference. Defaults to config.LLM_N_THREADS.
-        n_ctx:      Context window size. Keep at 512-1024 for speed.
-        verbose:    Show llama.cpp logs. Set True to debug.
-    """
 
     def __init__(
         self,
-        model_path: Optional[str] = None,
-        n_threads: Optional[int] = None,
-        n_ctx: Optional[int] = None,
+        model_path: str,
+        n_threads: int = 8,
+        n_ctx: int = 2048,
         verbose: bool = False,
     ):
-        import config
 
-        self._model_path = model_path or config.LLM_MODEL_PATH
-        self._n_threads  = n_threads  or config.LLM_N_THREADS
-        self._n_ctx      = n_ctx      or config.LLM_N_CTX
-        self._verbose    = verbose
-        self._llm        = None        # lazy load
+        self._model_path = model_path
+        self._n_threads = n_threads
+        self._n_ctx = n_ctx
+        self._verbose = verbose
 
-    # ── Lazy model loader ─────────────────────────────────────────────────────
+        self._llm = None
 
-    def _load(self) -> None:
+    def _load(self):
+
         if self._llm is not None:
             return
-        try:
-            from llama_cpp import Llama
-        except ImportError:
-            raise RuntimeError(
-                "llama-cpp-python is not installed. "
-                "Run: pip install llama-cpp-python"
-            )
 
-        logger.info("Loading LLM from %s …", self._model_path)
+        from llama_cpp import Llama
+
+        logger.info("Loading LLM...")
+
         t0 = time.perf_counter()
+
         self._llm = Llama(
             model_path=self._model_path,
             n_ctx=self._n_ctx,
             n_threads=self._n_threads,
             verbose=self._verbose,
         )
-        logger.info("LLM loaded in %.1fs", time.perf_counter() - t0)
 
-    # ── Single candidate scorer ───────────────────────────────────────────────
+        logger.info(
+            "LLM loaded in %.2fs",
+            time.perf_counter() - t0
+        )
 
-    def score_one(self, jd_summary: str, candidate_summary: str) -> float:
-        """
-        Score a single candidate. Returns float in [0.0, 1.0].
-        Returns 0.5 (neutral) on any parse or inference failure.
-        """
+    def score_one(
+        self,
+        jd_summary: str,
+        candidate_summary: str
+    ) -> float:
+
         self._load()
 
-        prompt = SCORING_PROMPT_TEMPLATE.format(
-            jd_summary=jd_summary,
-            candidate_summary=candidate_summary,
-        )
+        messages = [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content":SCORING_PROMPT_TEMPLATE.format(
+                    jd_summary = jd_summary,
+                    candidate_summary = candidate_summary
+                )
+            }
+        ]
 
         try:
-            out = self._llm(
-                prompt,
-                max_tokens=4,       # "10" or "7.5" — never more
-                temperature=0.0,    # deterministic
-                stop=["\n", " ", "."],
+
+            out = self._llm.create_chat_completion(
+                messages=messages,
+                temperature=0.0,
+                max_tokens=3
             )
-            raw = out["choices"][0]["text"].strip()
+
+            raw = (
+                out["choices"][0]
+                ["message"]["content"]
+                .strip()
+            )
+
             score = float(raw)
-            # Clamp to [0, 10] then normalise to [0, 1]
-            score = max(0.0, min(10.0, score))
+
+            score = max(
+                0.0,
+                min(10.0, score)
+            )
+
             return score / 10.0
+
         except Exception as e:
-            logger.debug("LLM score parse failed (%s) — using neutral 0.5", e)
+
+            logger.debug(
+                "Failed to parse score (%s)",
+                e
+            )
+
             return 0.5
 
-    # ── Batch scorer (main entry point) ──────────────────────────────────────
-
-    def score_pool(
+    def score_candidates(
         self,
-        rrf_pool: list,
-        jd_intent,
-        candidate_store: dict,
-        top_n: Optional[int] = None,
-    ) -> list:
-        """
-        Score up to top_n candidates in rrf_pool. Attaches .llm_score to each.
+        candidates: list[CandidateFeatureVector],
+        jd: JDIntent,
+        max_workers: int = 8
+    ) -> list[tuple[str, float]]:
 
-        Args:
-            rrf_pool:        List of RRFResult objects (must have .candidate_id).
-            jd_intent:       Parsed JDIntent object.
-            candidate_store: Dict mapping candidate_id → CandidateFeatureVector.
-            top_n:           How many to score. Defaults to config.LLM_TOP_N.
+        self._load()
 
-        Returns:
-            The same rrf_pool list, with .llm_score set on each item.
-            Items beyond top_n get llm_score = 0.5 (neutral).
-        """
-        import config
-        top_n = top_n or config.LLM_TOP_N
-
-        jd_summary = build_jd_summary(jd_intent)
-        to_score   = rrf_pool[:top_n]
-        skipped    = rrf_pool[top_n:]
-
-        logger.info("LLM reranker: scoring %d candidates …", len(to_score))
         t0 = time.perf_counter()
 
+        logger.info(
+            "Preparing summaries for %d candidates...",
+            len(candidates)
+        )
+
+        jd_summary = build_jd_summary(jd)
+
+        with ThreadPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+
+            candidate_summaries = list(
+                executor.map(
+                    build_candidate_summary,
+                    candidates
+                )
+            )
+
+        logger.info(
+            "Starting LLM scoring..."
+        )
+
+        results = []
+
         scored = 0
-        failed = 0
 
-        for result in to_score:
-            cfv = candidate_store.get(result.candidate_id)
-            if cfv is None:
-                result.llm_score = 0.5
-                failed += 1
-                continue
+        for cfv, summary in zip(
+            candidates,
+            candidate_summaries
+        ):
 
-            candidate_summary = build_candidate_summary(cfv)
-            result.llm_score  = self.score_one(jd_summary, candidate_summary)
+            score = self.score_one(
+                jd_summary,
+                summary
+            )
+
+            results.append(
+                (
+                    cfv.candidate_id,
+                    score
+                )
+            )
+
             scored += 1
 
-        # Neutral score for candidates outside top_n
-        for result in skipped:
-            result.llm_score = 0.5
+            if scored % 10 == 0:
 
-        elapsed = time.perf_counter() - t0
+                logger.info(
+                    "Scored %d/%d candidates",
+                    scored,
+                    len(candidates)
+                )
+
+        elapsed = (
+            time.perf_counter() - t0
+        )
+
         logger.info(
-            "LLM reranker done: %d scored, %d skipped/failed in %.1fs (%.0fms/candidate)",
-            scored, failed, elapsed,
-            (elapsed / scored * 1000) if scored else 0,
+            "Finished scoring %d candidates in %.1fs",
+            len(candidates),
+            elapsed
         )
 
-        return rrf_pool
-
-    # ── Convenience: download model if missing ────────────────────────────────
-
-    @staticmethod
-    def download_model(
-        repo_id: str = "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-        filename: str = "qwen2.5-1.5b-instruct-q4_k_m.gguf",
-        local_dir: str = "models/",
-    ) -> str:
-        """
-        Download GGUF model from HuggingFace Hub into local_dir.
-        Call this from precompute.py, not from rank.py (requires network).
-
-        Returns the local path to the downloaded file.
-        """
-        try:
-            from huggingface_hub import hf_hub_download
-        except ImportError:
-            raise RuntimeError("pip install huggingface-hub")
-
-        logger.info("Downloading %s/%s → %s", repo_id, filename, local_dir)
-        path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            local_dir=local_dir,
+        results.sort(
+            key=lambda x: x[1],
+            reverse=True
         )
-        logger.info("Model saved to %s", path)
-        return path
+
+        return results

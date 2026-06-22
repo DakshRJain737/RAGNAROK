@@ -80,7 +80,9 @@ RRF_POOL_SIZE: int = 800
 
 # After honeypot filter, feed this many to the cross-encoder.
 # Must be >= SUBMISSION_TOP_K so the composite scorer can rank all 100.
-CROSS_ENCODER_TOP_K: int = 350
+CROSS_ENCODER_TOP_K: int = 250 # 350 before
+CE_SCORE_TOP_K: int = 250
+LLM_WEIGHT: float = 0.3
 
 # Final submission size (spec requirement).
 SUBMISSION_TOP_K: int = 100

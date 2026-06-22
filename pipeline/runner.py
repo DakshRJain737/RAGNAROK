@@ -180,7 +180,50 @@ class PipelineRunner:
         timings["composite_scoring"] = (time.perf_counter() - t0) * 1000
         logger.info("Composite scored %d candidates", len(composite_results))
 
-        # ── 6b. Min-max score normalization ──────────────────────────────
+        # ── 6b. LLM Reranker (blended at 30% into final_score) ───────────────
+        t0 = time.perf_counter()
+        try:
+            from scoring.llm_reranker import LLMReranker
+
+            llm_candidates = [
+                self._candidate_store[r.candidate_id]
+                for r in composite_results
+                if r.candidate_id in self._candidate_store
+            ]
+
+            reranker = LLMReranker(
+                model_path=config.LLM_MODEL_PATH,
+                n_threads=3,
+                n_ctx=2048,
+            )
+            llm_scores_raw = reranker.score_candidates(
+                 candidates=llm_candidates,
+                 jd=self._jd,
+                 )
+            llm_scores: dict[str, float] = dict(llm_scores_raw)
+
+            composite_results = [
+                dataclasses.replace(
+                    r,
+                    final_score=(
+                        (1 - config.LLM_WEIGHT) * r.final_score
+                        + config.LLM_WEIGHT * llm_scores.get(r.candidate_id, r.final_score)
+                    )
+                )
+                for r in composite_results
+            ]
+
+            composite_results.sort(key=lambda r: (-r.final_score, r.candidate_id))
+
+            logger.info(
+                "LLM reranker blended (weight=%.1f) on %d candidates.",
+                config.LLM_WEIGHT, len(llm_scores),
+            )
+        except Exception as e:
+            logger.warning("LLM reranker unavailable, skipping: %s", e)
+        timings["llm_reranker"] = (time.perf_counter() - t0) * 1000
+
+        # ── 6c. Min-max score normalization ──────────────────────────────
         # Spreads the score range to [0.1, 1.0] for non-disqualified candidates,
         # making the score column more discriminative and useful for evaluation.
         # Disqualified (score == 0.0) candidates stay at 0.0.

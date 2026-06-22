@@ -34,40 +34,7 @@ _RELOCATION_BONUS: float = config.RELOCATION_BONUS  # 0.03
 
 @dataclass(slots=True)
 class ComponentScores:
-    """
-    Full transparency record for one candidate's final composite score.
-
-    This is the OUTPUT of CompositeScorer.rank(). It is the primary sort key
-    for the final ranked list and maps to one CSV row in submission.csv.
-
-    Distinct from pipeline/schemas.py ComponentScores (which carries the
-    sub-score breakdown consumed by the trust layer / reasoning generator).
-    runner.py bridges these two when building RankedCandidate objects.
-
-    Attributes:
-        candidate_id             CAND_XXXXXXX.
-        final_score              Composite score in [0.0, 1.0] — primary sort key.
-        weighted_sum             (0.40×skill + 0.35×career + 0.25×behavioral)
-                                 before CE blend and adjustments.
-        cross_encoder_score      From cross_encoder.py (via RRFResult). Must be
-                                 populated before rank() is called.
-        skill_match_score        From scoring/skill_match.py.
-        career_quality_score     From scoring/career_quality.py.
-        behavioral_score         From scoring/behavioral.py.
-        trajectory_velocity      From scoring/trajectory.py — informational only,
-                                 NOT part of the weighted formula. career_quality.py
-                                 already folds career-pattern signal via
-                                 TrajectoryAnalyzer into career_quality_score.
-        rrf_score                From retrieval/rrf_fusion.py — preserved for eval.
-        paths_present            Retrieval paths that surfaced this candidate.
-        location_bonus_applied   Additive bonus value applied (0.0 if none).
-        uncertainty_penalty_applied  Confidence multiplier applied (1.0 = no penalty).
-                                 Sourced from BehavioralResult.uncertainty_penalty
-                                 (computed off RedrobSignals._SIGNAL_PRESENCE_CHECKS).
-                                 NOT recomputed locally.
-        hard_disqualifier        True if skill disqualifier forced score to 0.
-        honeypot_override        True if honeypot flag forced score to 0.
-    """
+    
     candidate_id:                str
     final_score:                 float
     weighted_sum:                float
@@ -100,39 +67,7 @@ def _location_bonus(cfv: CandidateFeatureVector, jd: JDIntent) -> float:
 
 
 class CompositeScorer:
-    """
-    Fuses skill-match, career-quality, behavioral, and cross-encoder signals
-    into a single ranked list of candidates.
-
-    Weights follow config.py exactly:
-        WEIGHT_SKILL=0.40, WEIGHT_CAREER=0.35, WEIGHT_BEHAVIORAL=0.25.
-    Cross-encoder blended in post-fusion at CE_BLEND_FACTOR (default 0.30).
-
-    trajectory_velocity (scoring/trajectory.py) is computed and exposed on
-    ComponentScores for visibility/debugging, but is intentionally NOT part
-    of the weighted formula — career_quality.py already folds career-pattern
-    signal (via TrajectoryAnalyzer) into career_quality_score. Adding
-    promotion velocity as a 4th weighted component changes every score in
-    the pool; do that deliberately by introducing a new config weight.
-
-    IMPORTANT: rank() expects a pool where cross_encoder_score is already
-    populated by cross_encoder.py. The runner must call cross_encoder.rerank()
-    BEFORE calling composite_scorer.rank().
-
-    Usage in pipeline/runner.py:
-        bscorer = BehavioralScorer()
-        composite_scorer = CompositeScorer(intent, candidates, bscorer)
-        # ... retrieval, rrf, honeypot filter, cross-encoder rerank ...
-        ranked: list[ComponentScores] = composite_scorer.rank(reranked_pool)
-
-    candidate_store accepts either:
-        - list[CandidateFeatureVector]           (matches every other
-          scorer's score_all(candidates) convention in this codebase), or
-        - dict[str, CandidateFeatureVector]      (id -> candidate, for
-          callers that already have the lookup built).
-    Either is normalised internally into a dict keyed by candidate_id.
-    """
-
+    
     def __init__(
         self,
         jd: JDIntent,
@@ -166,19 +101,7 @@ class CompositeScorer:
         self._trajectory_scorer: Optional[TrajectoryVelocityScorer] = None
 
     def rank(self, pool: list[RRFResult]) -> list[ComponentScores]:
-        """
-        Fuse all scoring components and return a ranked list.
-
-        Args:
-            pool: list[RRFResult] from cross_encoder.rerank() — MUST have
-                  cross_encoder_score already populated (not 0.0 from rrf_fusion).
-                  Candidates in pool but not in candidate_store are skipped
-                  with a warning.
-
-        Returns:
-            list[ComponentScores] sorted by final_score descending,
-            with candidate_id ascending as a tie-break (spec-compliant).
-        """
+        
         if not isinstance(pool, list):
             raise TypeError(f"pool must be list[RRFResult], got {type(pool).__name__}.")
         if not pool:
