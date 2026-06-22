@@ -11,10 +11,10 @@ from pipeline.schemas import CandidateFeatureVector, JDIntent
 
 logger = logging.getLogger(__name__)
 
-_W_PRODUCT_CO    = 0.35
-_W_YOE           = 0.30
-_W_STABILITY     = 0.20
-_W_DOMAIN        = 0.15
+_W_PRODUCT_CO = 0.20
+_W_YOE        = 0.30
+_W_STABILITY  = 0.25
+_W_DOMAIN     = 0.25
 
 assert abs(_W_PRODUCT_CO + _W_YOE + _W_STABILITY + _W_DOMAIN - 1.0) < 1e-9
 
@@ -136,27 +136,43 @@ class CareerQualityScorer:
     def _domain_match_score(self, candidate: CandidateFeatureVector) -> float:
         history = candidate.career_history
         if not history:
-            return 0.0
+            return 1.0
         total_months = sum(j.duration_months for j in history)
         if total_months == 0:
-            return 0.0
-        positive_months = sum(
-            j.duration_months for j in history
-            if j.industry_lower in _PRODUCT_INDUSTRIES
-        )
+            return 1.0
+
+        # Penalty-only: pure out-of-domain exposure reduces score from 1.0 baseline.
+        # Does not overlap with _product_co_score (which measures product-co time).
         penalty_months = sum(
             j.duration_months for j in history
             if j.industry_lower in _DOMAIN_PENALTY_INDUSTRIES
         )
-        raw = (positive_months - 0.5 * penalty_months) / total_months
-        return float(max(0.0, min(1.0, raw)))
+        if penalty_months == 0:
+            return 1.0
 
+        # Weight recent penalty jobs more heavily than old ones.
+        # Sort ascending by start_date so index 0 = oldest.
+        sorted_history = sorted(history, key=lambda j: j.start_date)
+        n = len(sorted_history)
+        weighted_penalty = 0.0
+        weighted_total = 0.0
+        for idx, job in enumerate(sorted_history):
+            recency_weight = 1.0 + (idx / n)  # ranges 1.0 (oldest) → ~2.0 (newest)
+            weighted_total += job.duration_months * recency_weight
+            if job.industry_lower in _DOMAIN_PENALTY_INDUSTRIES:
+                weighted_penalty += job.duration_months * recency_weight
+
+        if weighted_total == 0:
+            return 1.0
+
+        penalty_ratio = weighted_penalty / weighted_total
+        return float(max(0.0, 1.0 - penalty_ratio))
+    
     def __repr__(self) -> str:
         return (
             f"CareerQualityScorer("
             f"yoe_ideal=[{self._jd.yoe_ideal_min}, {self._jd.yoe_ideal_max}])"
-        )
-
+            )
 
 def score_career_quality(
     candidates: list[CandidateFeatureVector],

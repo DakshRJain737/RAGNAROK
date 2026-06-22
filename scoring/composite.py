@@ -247,7 +247,10 @@ class CompositeScorer:
 
             # ── Step 2: cross-encoder blend ───────────────────────────────
             # Refines placement without overriding config weights entirely.
-            blended = (1.0 - _CE_BLEND) * weighted_sum + _CE_BLEND * ce_score
+            if ce_score > 0.0:
+                blended = (1.0 - _CE_BLEND) * weighted_sum + _CE_BLEND * ce_score
+            else:
+                blended = weighted_sum
 
             # ── Step 3: uncertainty penalty ─────────────────────────
             unc_penalty = beh_result.uncertainty_penalty if beh_result else 1.0
@@ -258,6 +261,11 @@ class CompositeScorer:
             blended = min(1.0, blended + loc_bonus)
             
             blended = float(max(0.0, min(1.0, blended)))
+
+            # ── Step 4b ────────────────────────────────────────────────────
+            req_coverage = skill_results[cid].required_score
+            if req_coverage < config.REQUIRED_SKILL_COVERAGE_THRESHOLD:  # e.g. 0.30
+                blended = min(blended, config.REQUIRED_SKILL_COVERAGE_MAX_SCORE)  # e.g. 0.45
 
             # ── Step 5: hard overrides (after all arithmetic) ─────────────
             hard_disq     = skill_results[cid].hard_disqualifier
