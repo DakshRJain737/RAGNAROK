@@ -83,6 +83,7 @@ No I/O.  No network.  No side-effects.  Pure function.
 from __future__ import annotations
 
 import collections
+import datetime
 import logging
 from typing import Optional
 
@@ -265,17 +266,25 @@ def _scan_notice_period(
     30+ day notice candidates are still in scope but the bar gets higher."
     > 90 days is a meaningful operational risk, not just a preference.
 
+    We compute the earliest possible start date so the LLM has a concrete,
+    quotable fact rather than just a threshold reference.
+
     Thresholds: config.NOTICE_PERIOD_MAX (90), config.SKEPTIC_MODERATE_NOTICE_DAYS (60).
     """
     days = candidate.signals.notice_period_days
+
+    # Compute earliest start date as a human-readable month string.
+    today = datetime.date.today()
+    earliest_start = today + datetime.timedelta(days=days)
+    start_str = earliest_start.strftime("%b %Y")  # e.g. "Sep 2025"
 
     if days > _NOTICE_HIGH_DAYS:
         return SkepticSignal(
             label="Long notice period",
             severity=_HIGH,
             value=(
-                f"{days}-day notice period — exceeds {_NOTICE_HIGH_DAYS}d threshold; "
-                f"JD states this significantly raises the hiring bar"
+                f"{days}-day notice — earliest start: ~{start_str}; "
+                f"JD states notice >90 days significantly raises the hiring bar"
             ),
         )
     if days > _NOTICE_MOD_DAYS:
@@ -283,8 +292,8 @@ def _scan_notice_period(
             label="Long notice period",
             severity=_MOD,
             value=(
-                f"{days}-day notice period — above JD preferred ≤30 days "
-                f"and above {_NOTICE_MOD_DAYS}d moderate threshold"
+                f"{days}-day notice — earliest start: ~{start_str}; "
+                f"above JD preferred ≤30 days (confirm buyout feasibility)"
             ),
         )
     return None

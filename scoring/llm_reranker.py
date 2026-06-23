@@ -35,7 +35,7 @@ import logging
 import time
 from typing import Optional
 
-from pipeline.schemas import JDIntent, CandidateFeatureVector, TrustVerdict
+from pipeline.schemas import JDIntent, CandidateFeatureVector, TrustVerdict, ComponentScores
 
 logger = logging.getLogger(__name__)
 
@@ -44,29 +44,88 @@ logger = logging.getLogger(__name__)
 # Signal serialisation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Maximum character length for individual signal values in the LLM prompt.
+# Longer values give the LLM more concrete facts; 120 chars fits comfortably
+# within the 200-token input budget when combined with 3+2 signals.
+_SIGNAL_VAL_MAX: int = 120
+
+# Number of signals to include in the prompt block.
+_ADVOCATE_SIGNALS_IN_PROMPT: int = 3   # top-3 advocate (HIGH first)
+_SKEPTIC_SIGNALS_IN_PROMPT: int = 2    # top-2 skeptic (HIGH first)
+
+
 def _build_signal_block(trust: TrustVerdict) -> str:
     """
-    Convert advocate + skeptic signals into a compact, LLM-readable fact block.
+    Convert advocate + skeptic signals into a rich, grouped, LLM-readable fact
+    block with full-length values and the top falsifiability condition.
 
-    Outputs format:
-        STRENGTHS (HIGH): 75% required skills matched: FAISS, sentence-transformers
-        STRENGTHS (MED): 3 product company roles: Zomato, Razorpay
-        RISKS (HIGH): Last active 120 days ago
-        RISKS (MOD): Consulting-only background
+    Output format (example):
+        STRENGTHS
+          [HIGH] Required skill coverage: 82% of required skills matched: FAISS, sentence-transformers, BGE
+          [HIGH] Product-company experience: 3 product company roles: Swiggy, Zepto, Razorpay
+          [MED]  Career trajectory velocity: 78% velocity percentile (~1.2 promotions/yr)
+        RISKS
+          [HIGH] Platform inactivity: Last active ~4 months ago (120 days) — above 90-day threshold
+          [MOD]  Partial required skill coverage: gaps: LoRA, XGBoost LTR
+        KEY CONDITION: verify candidate is actively looking (120 days inactive)
 
-    Capped at top-3 advocate + top-2 skeptic signals to control token count.
+    Caps at top-3 advocate + top-2 skeptic signals to stay within the 200-token
+    input budget.  Signal values are allowed up to _SIGNAL_VAL_MAX chars so the
+    LLM receives specific skill names, companies, and numbers rather than
+    truncated fragments.
     """
     lines: list[str] = []
 
-    # Top-2 advocate signals (already sorted HIGH first)
-    for sig in trust.advocate_signals[:2]:
-        val = sig.value[:55].rstrip()
-        lines.append(f"+[{sig.confidence[0]}] {sig.label}: {val}")
+    # ── STRENGTHS block ───────────────────────────────────────────────────────
+    adv_signals = trust.advocate_signals[:_ADVOCATE_SIGNALS_IN_PROMPT]
+    if adv_signals:
+        lines.append("STRENGTHS")
+        for sig in adv_signals:
+            # Keep the full value up to _SIGNAL_VAL_MAX chars — smart truncation
+            # at the last comma to avoid mid-skill-name cuts.
+            val = sig.value[:_SIGNAL_VAL_MAX].rstrip()
+            if len(sig.value) > _SIGNAL_VAL_MAX:
+                last_comma = val.rfind(", ")
+                val = val[:last_comma] + "…" if last_comma > _SIGNAL_VAL_MAX // 2 else val + "…"
+            # Pad tier label so columns align — easier for the LLM to parse.
+            tier_tag = f"[{sig.confidence:<3}]".replace("MED", "MED").replace("LOW", "LOW")
+            lines.append(f"  {tier_tag} {sig.label}: {val}")
 
-    # Top-1 skeptic signal
-    for sig in trust.skeptic_signals[:1]:
-        val = sig.value[:55].rstrip()
-        lines.append(f"-[{sig.severity[0]}] {sig.label}: {val}")
+    # ── RISKS block ───────────────────────────────────────────────────────────
+    skep_signals = trust.skeptic_signals[:_SKEPTIC_SIGNALS_IN_PROMPT]
+    if skep_signals:
+        lines.append("RISKS")
+        for sig in skep_signals:
+            val = sig.value[:_SIGNAL_VAL_MAX].rstrip()
+            if len(sig.value) > _SIGNAL_VAL_MAX:
+                last_comma = val.rfind(", ")
+                val = val[:last_comma] + "…" if last_comma > _SIGNAL_VAL_MAX // 2 else val + "…"
+            # Map MODERATE → MOD for alignment.
+            sev_tag = sig.severity.replace("MODERATE", "MOD ")
+            lines.append(f"  [{sev_tag:<3}] {sig.label}: {val}")
+
+    # ── KEY CONDITION (top falsifiability condition) ───────────────────────────
+    # The falsifiability contract is the most interview-actionable fact in the
+    # trust verdict.  Including it gives the LLM a concrete closing hook for
+    # Sentence 2 instead of just repeating the verdict word.
+    if trust.falsifiability:
+        # Strip the long "This ranking holds UNLESS " prefix to a compact form.
+        cond = trust.falsifiability[0]
+        for prefix in (
+            "This ranking holds UNLESS ",
+            "This ranking becomes MORE ROBUST if ",
+            "This ranking is critically weakened by ",
+            "This ranking is notably affected if ",
+            "This ranking is marginally affected by ",
+            "This ranking\'s confidence is reduced by ",
+        ):
+            if cond.startswith(prefix):
+                cond = cond[len(prefix):].strip()
+                break
+        # Cap the condition to 90 chars.
+        if len(cond) > 90:
+            cond = cond[:87].rstrip() + "…"
+        lines.append(f"KEY CONDITION: {cond}")
 
     return "\n".join(lines) if lines else "(no signals)"
 
@@ -89,14 +148,21 @@ def _tier_label(rank: int) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = (
-    "Technical recruiter brief: 2 sentences using ONLY the given facts. "
-    "Sentence 1: strongest signal (+ or -) that explains position. "
-    "Sentence 2: key counterpoint. Name skills/companies/numbers. No filler."
+    "You are a technical recruiter writing a 2-sentence candidate brief. "
+    "Use ONLY the facts listed below — no invented claims. "
+    "Sentence 1: state the single most important fact (strength or risk) "
+    "specific to THIS candidate — name the exact skill, company, or number. "
+    "Do NOT open with 'The strongest signal that explains the position'. "
+    "Start directly with the fact (e.g. '82% skill match across FAISS...' or "
+    "'Inactive 120 days — availability unclear...'). "
+    "Sentence 2: give the key counterpoint or the KEY CONDITION that would change this assessment. "
+    "Be concise. No filler phrases."
 )
 
 _USER_TEMPLATE = """\
 Job: Senior AI Eng | 5-9yr | product-co | retrieval/ranking skills
-Tier: {tier} | {verdict} ({confidence}% confidence)
+Rank #{rank} of 100 | {tier} | {verdict} ({confidence}% confidence)
+Candidate: {yoe}yr exp | composite score {composite:.3f}
 Facts:
 {signal_block}
 Brief:"""
@@ -131,6 +197,7 @@ class LLMReranker:
     def _load(self) -> None:
         if self._llm is not None:
             return
+        # pyrefly: ignore [missing-import]
         from llama_cpp import Llama
         logger.info("Loading LLM for justification …")
         t0 = time.perf_counter()
@@ -149,15 +216,19 @@ class LLMReranker:
         rank: int,
         trust: TrustVerdict,
         fallback: str,
+        candidate: Optional[CandidateFeatureVector] = None,
+        composite_score: float = 0.0,
     ) -> str:
         """
         Generate a 2-sentence justification for one candidate using trust signals.
 
         Parameters
         ----------
-        rank     : Final rank (1–100)
-        trust    : TrustVerdict with advocate + skeptic signals
-        fallback : Rule-based reasoning string to return on LLM failure
+        rank            : Final rank (1–100)
+        trust           : TrustVerdict with advocate + skeptic signals
+        fallback        : Rule-based reasoning string to return on LLM failure
+        candidate       : CandidateFeatureVector for YOE in the prompt header
+        composite_score : Normalised composite score [0.10–1.00] for the header
 
         Returns
         -------
@@ -165,11 +236,15 @@ class LLMReranker:
         """
         signal_block = _build_signal_block(trust)
         tier = _tier_label(rank)
+        yoe = f"{candidate.years_of_experience:.1f}" if candidate else "?"
 
         prompt = _USER_TEMPLATE.format(
+            rank=rank,
             tier=tier,
             verdict=trust.verdict,
             confidence=int(round(trust.confidence_pct)),
+            yoe=yoe,
+            composite=composite_score,
             signal_block=signal_block,
         )
 
@@ -181,15 +256,25 @@ class LLMReranker:
         try:
             out = self._llm.create_chat_completion(
                 messages=messages,
-                temperature=0.7,     # tiny warmth for natural phrasing, no randomness
-                max_tokens=80,       # ~60 words — enough for 2 tight sentences
-                stop=["\n\n", "Sentence 3", "3."],  # prevent runaway
+                temperature=0.4,     # lower temperature for more factual, less random phrasing
+                max_tokens=100,       # slightly more room for fact-rich sentences
+                stop=["\n\n", "Sentence 3", "3.", "\nJob:"],  # prevent runaway / prompt echo
             )
             text = out["choices"][0]["message"]["content"].strip()
 
-            # Sanity: reject if too short or is clearly an echo of the prompt
-            if len(text) < 30 or text.startswith("Write") or text.startswith("You are"):
-                logger.debug("LLM output rejected (too short or echo): %r", text[:60])
+            # Sanity: reject if too short or echoes known generic/prompt phrases.
+            # These patterns indicate the model is repeating instructions rather
+            # than grounding in the candidate-specific facts.
+            _BANNED_OPENERS = (
+                "Write",
+                "You are",
+                "Job:",
+                "The strongest signal that explains the position",
+                "The single most important fact specific to this candidate is",
+                "The key strength is the candidate",  # another observed echo
+            )
+            if len(text) < 30 or any(text.startswith(p) for p in _BANNED_OPENERS):
+                logger.debug("LLM output rejected (too short or generic echo): %r", text[:80])
                 return fallback
 
             # Hard cap at 320 chars for CSV column safety
@@ -209,23 +294,27 @@ class LLMReranker:
         trust_verdicts: Optional[dict[str, TrustVerdict]] = None,
         fallbacks: Optional[dict[str, str]] = None,
         top_n: Optional[int] = None,
+        composite_scores: Optional[dict[str, float]] = None,
     ) -> dict[str, str]:
         """
         Generate 2-sentence justifications for top-N candidates.
 
         Parameters
         ----------
-        candidates    : top-100 CandidateFeatureVectors, in rank order
-        jd            : JDIntent (used only for fallback blurb)
-        ranks         : dict[candidate_id -> rank_int]
-        trust_verdicts: dict[candidate_id -> TrustVerdict] from the trust layer.
-                        If None or a candidate is missing, falls back to fallback string.
-        fallbacks     : dict[candidate_id -> rule_based_reasoning_str].
-                        Used when LLM call fails or trust verdict is unavailable.
-        top_n         : If set, only run LLM inference for candidates whose rank is
-                        <= top_n. Candidates ranked beyond top_n automatically receive
-                        the rule-based fallback string (no LLM call, zero latency).
-                        None means run for all candidates (legacy behaviour).
+        candidates       : top-100 CandidateFeatureVectors, in rank order
+        jd               : JDIntent (used only for fallback blurb)
+        ranks            : dict[candidate_id -> rank_int]
+        trust_verdicts   : dict[candidate_id -> TrustVerdict] from the trust layer.
+                           If None or a candidate is missing, falls back to fallback string.
+        fallbacks        : dict[candidate_id -> rule_based_reasoning_str].
+                           Used when LLM call fails or trust verdict is unavailable.
+        top_n            : If set, only run LLM inference for candidates whose rank is
+                           <= top_n. Candidates ranked beyond top_n automatically receive
+                           the rule-based fallback string (no LLM call, zero latency).
+                           None means run for all candidates (legacy behaviour).
+        composite_scores : dict[candidate_id -> normalised_composite_score] from
+                           the pipeline's score normalisation step. Used to populate
+                           the candidate header in the prompt. Pass None to omit.
 
         Returns
         -------
@@ -265,10 +354,18 @@ class LLMReranker:
                 skipped_count += 1
                 continue
 
+            # Retrieve normalised composite score from the trust verdict's
+            # confidence_pct as a proxy when the score dict isn't passed.
+            # The composite score for the candidate header comes from the
+            # composite_scores dict if provided, else falls back to 0.0.
+            composite = composite_scores.get(cid, 0.0) if composite_scores else 0.0
+
             justification = self._justify_one(
                 rank=rank,
                 trust=trust,
                 fallback=fallback,
+                candidate=cfv,
+                composite_score=composite,
             )
             results[cid] = justification
             llm_count += 1

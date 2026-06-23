@@ -331,6 +331,11 @@ class PipelineRunner:
                     "ranks %d–%d use rule-based reasoning.",
                     llm_top_n, llm_top_n + 1, top_k,
                 )
+                # Build composite score lookup from the already-normalised results.
+                composite_scores_map: dict[str, float] = {
+                    cs.candidate_id: cs.final_score
+                    for cs in composite_results[:top_k]
+                }
                 llm_justifications = llm_reranker.justify_candidates(
                     candidates=top100_cfvs,
                     jd=self._jd,
@@ -338,6 +343,7 @@ class PipelineRunner:
                     trust_verdicts=dict(trust_verdicts),  # advocate/skeptic signals
                     fallbacks=dict(reasonings),           # rule-based as fallback
                     top_n=llm_top_n,
+                    composite_scores=composite_scores_map,
                 )
                 # Override rule-based reasoning with LLM output where available
                 for cid, justification in llm_justifications.items():

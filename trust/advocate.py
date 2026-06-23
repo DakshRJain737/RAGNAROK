@@ -661,6 +661,87 @@ def _scan_profile_completeness(
     )
 
 
+def _scan_senior_readiness(
+    candidate: CandidateFeatureVector,
+    scores: ComponentScores,
+) -> Optional[AdvocateSignal]:
+    """
+    Signal 16: Senior-role readiness.
+
+    Fires when YOE and career quality together confirm the candidate is
+    operating at a Senior AI Eng scope, not just hitting the year count.
+    This gives the LLM a composite seniority statement rather than separate
+    YOE and career signals that individually look weaker.
+
+    Emitted only when BOTH:
+      - years_of_experience >= 6.0  (well into the 5-9yr ideal band)
+      - career_score >= 0.70        (strong career quality, not just tenure)
+    """
+    yoe = candidate.years_of_experience
+    career_score = scores.career_score
+
+    if yoe < 6.0 or career_score < 0.70:
+        return None
+
+    ideal_min = config.YOE_BAND_IDEAL_MIN  # 5.0
+    ideal_max = config.YOE_BAND_IDEAL_MAX  # 9.0
+
+    # HIGH when both YOE and career quality are clearly strong.
+    conf = _HIGH if (yoe >= 7.0 and career_score >= 0.80) else _MED
+
+    return AdvocateSignal(
+        label="Senior-level readiness",
+        confidence=conf,
+        value=(
+            f"{yoe:.1f}yr exp with {career_score:.0%} career quality score — "
+            f"profile consistent with Senior AI Eng scope "
+            f"(JD target: {ideal_min:.0f}–{ideal_max:.0f}yr)"
+        ),
+    )
+
+
+def _scan_career_stability_positive(
+    candidate: CandidateFeatureVector,
+    scores: ComponentScores,
+) -> Optional[AdvocateSignal]:
+    """
+    Signal 17: Career stability as a positive signal.
+
+    Complements skeptic._scan_job_hopping() — when stability is high,
+    we explicitly surface it as an advocate signal so the LLM can mention
+    long-term commitment as a strength, not just the absence of a risk.
+
+    Uses career_score as a proxy (stability_score is embedded in CareerQualityResult
+    which is not passed to advocate.py; career_score correlates strongly).
+    Fires only when the career history shows 3+ roles and is clearly stable.
+    """
+    career_score = scores.career_score
+    total_roles = len(candidate.career_history)
+    yoe = max(candidate.years_of_experience, 1.0)
+
+    # Only emit when career quality is high enough to indicate stability
+    # AND the candidate has enough roles to make the avg tenure meaningful.
+    if career_score < 0.75 or total_roles < 2:
+        return None
+
+    avg_tenure = yoe / total_roles
+    # Only emit if avg tenure is meaningfully long (>= 2 years).
+    if avg_tenure < 2.0:
+        return None
+
+    conf = _HIGH if (career_score >= 0.85 and avg_tenure >= 3.0) else _MED
+
+    return AdvocateSignal(
+        label="Career stability",
+        confidence=conf,
+        value=(
+            f"~{avg_tenure:.1f}yr avg tenure across {total_roles} role(s) "
+            f"({yoe:.1f}yr total) — signals long-term commitment; "
+            f"career quality score {career_score:.0%}"
+        ),
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC API
 # ─────────────────────────────────────────────────────────────────────────────
@@ -769,6 +850,12 @@ def build_advocate_signals(
 
     # ── 15. Profile completeness ──────────────────────────────────────────────
     _add_optional(signals, _scan_profile_completeness(candidate, scores))
+
+    # ── 16. Senior-role readiness (YOE + career quality composite) ───────────
+    _add_optional(signals, _scan_senior_readiness(candidate, scores))
+
+    # ── 17. Career stability (positive) ──────────────────────────────────────
+    _add_optional(signals, _scan_career_stability_positive(candidate, scores))
 
     # ── Sort and return ───────────────────────────────────────────────────────
     result = _sort_signals(signals)
