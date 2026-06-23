@@ -243,6 +243,18 @@ class PipelineRunner:
                 c_res = career_results.get(cid)
                 b_res = behavioral_results.get(cid)
 
+                missing = [
+                    name for name, res in
+                    [("skill", s_res), ("career", c_res), ("behavioral", b_res)]
+                    if not res
+                ]
+                if missing:
+                    logger.warning(
+                        "Trust: missing scorer results for %s (rank %d): %s — "
+                        "no trust verdict will be built; rule-based fallback will be used.",
+                        cid, rank_pos, missing,
+                    )
+
                 if s_res and c_res and b_res:
                     schema_comp = ComponentScores(
                         candidate_id=cid,
@@ -313,12 +325,19 @@ class PipelineRunner:
                     n_threads=getattr(config, "LLM_N_THREADS", 8),
                     n_ctx=getattr(config, "LLM_N_CTX", 512),
                 )
+                llm_top_n = getattr(config, "LLM_RERANKER_TOP_N", 60)
+                logger.info(
+                    "LLM: will run inference for top-%d candidates; "
+                    "ranks %d–%d use rule-based reasoning.",
+                    llm_top_n, llm_top_n + 1, top_k,
+                )
                 llm_justifications = llm_reranker.justify_candidates(
                     candidates=top100_cfvs,
                     jd=self._jd,
                     ranks=ranks_map,
                     trust_verdicts=dict(trust_verdicts),  # advocate/skeptic signals
                     fallbacks=dict(reasonings),           # rule-based as fallback
+                    top_n=llm_top_n,
                 )
                 # Override rule-based reasoning with LLM output where available
                 for cid, justification in llm_justifications.items():

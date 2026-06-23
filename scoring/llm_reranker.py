@@ -208,9 +208,10 @@ class LLMReranker:
         ranks: dict[str, int],
         trust_verdicts: Optional[dict[str, TrustVerdict]] = None,
         fallbacks: Optional[dict[str, str]] = None,
+        top_n: Optional[int] = None,
     ) -> dict[str, str]:
         """
-        Generate 2-sentence justifications for top-100 candidates.
+        Generate 2-sentence justifications for top-N candidates.
 
         Parameters
         ----------
@@ -221,6 +222,10 @@ class LLMReranker:
                         If None or a candidate is missing, falls back to fallback string.
         fallbacks     : dict[candidate_id -> rule_based_reasoning_str].
                         Used when LLM call fails or trust verdict is unavailable.
+        top_n         : If set, only run LLM inference for candidates whose rank is
+                        <= top_n. Candidates ranked beyond top_n automatically receive
+                        the rule-based fallback string (no LLM call, zero latency).
+                        None means run for all candidates (legacy behaviour).
 
         Returns
         -------
@@ -238,16 +243,26 @@ class LLMReranker:
             len(candidates),
         )
 
+        llm_count = 0
+        skipped_count = 0
+
         for i, cfv in enumerate(candidates, start=1):
             cid = cfv.candidate_id
             rank = ranks.get(cid, i)
             fallback = fallbacks.get(cid, f"Ranked based on composite score (rank {rank}).")
+
+            # Skip LLM for candidates ranked beyond top_n — use rule-based fallback.
+            if top_n is not None and rank > top_n:
+                results[cid] = fallback
+                skipped_count += 1
+                continue
 
             trust = trust_verdicts.get(cid)
             if trust is None:
                 # No trust verdict available — use fallback directly
                 logger.debug("LLM: no trust verdict for %s, using fallback", cid)
                 results[cid] = fallback
+                skipped_count += 1
                 continue
 
             justification = self._justify_one(
@@ -256,20 +271,22 @@ class LLMReranker:
                 fallback=fallback,
             )
             results[cid] = justification
+            llm_count += 1
 
-            if i % 10 == 0 or i == len(candidates):
+            if llm_count % 10 == 0 or i == len(candidates):
                 elapsed = time.perf_counter() - t0
-                rate = i / elapsed if elapsed > 0 else 1.0
-                eta = (len(candidates) - i) / rate if rate > 0 else 0.0
+                rate = llm_count / elapsed if elapsed > 0 and llm_count > 0 else 1.0
+                remaining_llm = max(0, (top_n or len(candidates)) - llm_count)
+                eta = remaining_llm / rate if rate > 0 else 0.0
                 logger.info(
-                    "LLM: %d/%d done | %.1fs elapsed | ETA %.0fs",
-                    i, len(candidates), elapsed, eta,
+                    "LLM: %d/%d done | %d skipped (rule-based) | %.1fs elapsed | ETA %.0fs",
+                    llm_count, top_n or len(candidates), skipped_count, elapsed, eta,
                 )
 
         elapsed = time.perf_counter() - t0
         logger.info(
-            "LLM: justified %d candidates in %.1fs (%.2f s/candidate)",
-            len(candidates), elapsed,
-            elapsed / max(1, len(candidates)),
+            "LLM: justified %d candidates via LLM, %d via rule-based, in %.1fs (%.2f s/LLM-candidate)",
+            llm_count, skipped_count, elapsed,
+            elapsed / max(1, llm_count),
         )
         return results

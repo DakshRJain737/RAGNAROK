@@ -80,9 +80,16 @@ RRF_POOL_SIZE: int = 800
 
 # After honeypot filter, feed this many to the cross-encoder.
 # Must be >= SUBMISSION_TOP_K so the composite scorer can rank all 100.
-CROSS_ENCODER_TOP_K: int = 250 # 350 before
-CE_SCORE_TOP_K: int = 250
+CROSS_ENCODER_TOP_K: int = 350 
+CE_SCORE_TOP_K: int = 350
 LLM_WEIGHT: float = 0.3
+
+# LLM justification: only generate LLM briefs for this many top candidates.
+# Candidates ranked below this threshold keep the rule-based reasoning_generator
+# output (which is already signal-grounded and high quality).
+# 60 covers the full ELITE+STRONG+MID tiers; WEAK tier (61-100) uses rule-based.
+# Lower this value (e.g. 30) to trade justification coverage for faster runtime.
+LLM_RERANKER_TOP_N: int = 60
 
 # Final submission size (spec requirement).
 SUBMISSION_TOP_K: int = 100
