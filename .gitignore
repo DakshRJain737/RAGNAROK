@@ -37,3 +37,5 @@ data/candidates.jsonl
 .idea/
 .vscode/
 *.swp
+
+models/
