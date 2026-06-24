@@ -1,35 +1,3 @@
-"""
-scoring/llm_reranker.py — LLM justification layer for top-100 candidates.
-
-ROLE
-----
-Last step in the pipeline — called AFTER composite scoring, cross-encoder,
-and the trust (advocate/skeptic) layer have all completed.
-
-Does NOT affect any score. Generates a 2-sentence recruiter brief that
-justifies why a candidate holds their specific rank, grounded in the
-advocate/skeptic signals that were already computed by the trust layer.
-
-DESIGN
-------
-- Advocate signals  (confirmed strengths, HIGH→MEDIUM→LOW)
-- Skeptic signals   (confirmed risks, HIGH→MODERATE→LOW)
-...are serialised into a compact fact-block and injected into the LLM prompt.
-The LLM's only job is to weave those facts into fluent, rank-specific language.
-It cannot invent facts — every claim it makes must trace to a signal value.
-
-Prompt budget: ~200 input tokens, 80 output tokens → ~1.5–2s on Qwen 1.5B Q4.
-100 candidates × 2s ≈ 200s — within the 5-min pipeline wall clock.
-
-Usage (called from pipeline/runner.py):
-    reranker = LLMReranker(model_path=config.LLM_MODEL_PATH)
-    reranker.preload()                          # warm model at startup
-    justifications = reranker.justify_candidates(
-        top100_cfvs, jd, ranks, trust_verdicts, fallbacks
-    )
-    # justifications: dict[candidate_id -> str]
-"""
-
 from __future__ import annotations
 
 import logging
@@ -55,19 +23,7 @@ _SKEPTIC_SIGNALS_IN_PROMPT: int = 2    # top-2 skeptic (HIGH first)
 
 
 def _smart_truncate(value: str, max_len: int) -> str:
-    """
-    Truncate *value* to at most *max_len* characters, preferring a clean break
-    at the last ", " that falls in the *upper half* of the allowed window.
-
-    FIX (bottleneck 3): the original code checked `last_comma > max_len // 2`
-    but evaluated that condition AFTER slicing to max_len — meaning it tested
-    whether the comma appeared beyond the midpoint of the *already-truncated*
-    slice, which is always true for any comma in the upper half.  The intended
-    semantics are: "only break at a comma if it's in the upper half of the
-    budget" — i.e. we keep at least half the budget.  We now check that the
-    comma position is >= max_len // 2 (not strictly greater-than), which
-    correctly gates on a meaningful break rather than always appending "…".
-    """
+    
     if len(value) <= max_len:
         return value
     sliced = value[:max_len].rstrip()
@@ -78,20 +34,6 @@ def _smart_truncate(value: str, max_len: int) -> str:
 
 
 def _build_signal_block(trust: TrustVerdict) -> str:
-    """
-    Convert advocate + skeptic signals into a rich, grouped, LLM-readable fact
-    block with full-length values and the top falsifiability condition.
-
-    Output format (example):
-        STRENGTHS
-          [HIGH] Required skill coverage: 82% of required skills matched: FAISS, sentence-transformers, BGE
-          [HIGH] Product-company experience: 3 product company roles: Swiggy, Zepto, Razorpay
-          [MED]  Career trajectory velocity: 78% velocity percentile (~1.2 promotions/yr)
-        RISKS
-          [HIGH] Platform inactivity: Last active ~4 months ago (120 days) — above 90-day threshold
-          [MOD]  Partial required skill coverage: gaps: LoRA, XGBoost LTR
-        KEY CONDITION: verify candidate is actively looking (120 days inactive)
-    """
     lines: list[str] = []
 
     # ── STRENGTHS block ───────────────────────────────────────────────────────
@@ -187,13 +129,9 @@ class LLMReranker:
     def __init__(
         self,
         model_path: str,
-        n_threads: int = 8,
+        n_threads: int = 4,
         n_ctx: int = 512,
         verbose: bool = False,
-        # FIX (bottleneck 2): configurable worker count for parallel inference.
-        # llama-cpp-python releases the GIL during native inference so threads
-        # give real concurrency. Default 4 is conservative; increase on machines
-        # with sufficient RAM to hold multiple KV-cache copies simultaneously.
         max_workers: int = 4,
     ) -> None:
         self._model_path = model_path
@@ -203,9 +141,6 @@ class LLMReranker:
         self._max_workers = max_workers
         self._llm = None
 
-    # FIX (bottleneck 1): expose an explicit preload() so the runner can warm
-    # the model at startup rather than paying the load cost inside the first
-    # inference call. _load() is still guarded so double-calling is safe.
     def preload(self) -> None:
         """
         Eagerly load the GGUF model into memory.
@@ -242,21 +177,6 @@ class LLMReranker:
         candidate: Optional[CandidateFeatureVector] = None,
         composite_score: float = 0.0,
     ) -> str:
-        """
-        Generate a 2-sentence justification for one candidate using trust signals.
-
-        Parameters
-        ----------
-        rank            : Final rank (1–100)
-        trust           : TrustVerdict with advocate + skeptic signals
-        fallback        : Rule-based reasoning string to return on LLM failure
-        candidate       : CandidateFeatureVector for YOE in the prompt header
-        composite_score : Normalised composite score [0.10–1.00] for the header
-
-        Returns
-        -------
-        str — 2-sentence recruiter brief
-        """
         signal_block = _build_signal_block(trust)
         tier = _tier_label(rank)
         yoe = f"{candidate.years_of_experience:.1f}" if candidate else "?"
@@ -315,41 +235,12 @@ class LLMReranker:
         top_n: Optional[int] = None,
         composite_scores: Optional[dict[str, float]] = None,
     ) -> dict[str, str]:
-        """
-        Generate 2-sentence justifications for top-N candidates.
-
-        Parameters
-        ----------
-        candidates       : top-100 CandidateFeatureVectors, in rank order
-        jd               : JDIntent (used only for fallback blurb)
-        ranks            : dict[candidate_id -> rank_int]
-        trust_verdicts   : dict[candidate_id -> TrustVerdict] from the trust layer.
-                           If None or a candidate is missing, falls back to fallback string.
-        fallbacks        : dict[candidate_id -> rule_based_reasoning_str].
-                           Used when LLM call fails or trust verdict is unavailable.
-        top_n            : If set, only run LLM inference for candidates whose rank is
-                           <= top_n. Candidates ranked beyond top_n automatically receive
-                           the rule-based fallback string (no LLM call, zero latency).
-                           None means run for all candidates (legacy behaviour).
-        composite_scores : dict[candidate_id -> normalised_composite_score] from
-                           the pipeline's score normalisation step. Used to populate
-                           the candidate header in the prompt. Pass None to omit.
-
-        Returns
-        -------
-        dict[candidate_id -> justification_str]
-        """
+        
         self._load()
 
         trust_verdicts = trust_verdicts or {}
         fallbacks = fallbacks or {}
 
-        # FIX (bottleneck 5): hoist the composite_scores guard out of the hot
-        # loop.  Using a read-only empty dict as the default means the inner
-        # body is always a plain .get() call with no conditional branch, and an
-        # empty dict passed by the caller is handled identically to None — both
-        # produce 0.0 for every candidate — but we now emit a warning so the
-        # caller knows their score headers will be blank.
         _composite: dict[str, float] = composite_scores or {}
         if composite_scores is not None and len(composite_scores) == 0:
             logger.warning(
@@ -366,9 +257,6 @@ class LLMReranker:
             cid = cfv.candidate_id
             rank = ranks.get(cid, i)
 
-            # FIX (bottleneck 4 / missing-fallback): build the fallback string
-            # once and log a warning if it falls through to the generic default,
-            # so callers can tell a genuine rule-based fallback from a data gap.
             raw_fallback = fallbacks.get(cid)
             if raw_fallback is None:
                 logger.warning(
@@ -404,11 +292,6 @@ class LLMReranker:
         if not llm_batch:
             return results
 
-        # FIX (bottleneck 2): run LLM inference in parallel using a thread pool.
-        # llama-cpp-python's create_chat_completion() releases the GIL during
-        # the native C++ inference pass, so threads give real concurrency here.
-        # max_workers is configurable at __init__ time; default 4 is a safe
-        # starting point that avoids excessive KV-cache memory pressure.
         llm_count = 0
         skipped_count = len(candidates) - len(llm_batch)
 
@@ -430,10 +313,6 @@ class LLMReranker:
                     results[cid] = justification
                     llm_count += 1
 
-                    # FIX (bottleneck 4 / duplicate log): log every 10 *completions*
-                    # (not every 10 iterations), so the modulo never fires twice for
-                    # the same boundary. ETA now counts only the remaining LLM work,
-                    # not the already-skipped rule-based candidates.
                     if llm_count % 10 == 0:
                         elapsed = time.perf_counter() - t0
                         rate = llm_count / elapsed if elapsed > 0 else 1.0
