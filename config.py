@@ -373,15 +373,24 @@ LLM_TOP_N: int = 300
 # CPU threads for llama.cpp inference.
 # Set to your machine's physical core count for best throughput.
 LLM_N_THREADS: int = 8
- 
-# Context window. Must be large enough to fit system prompt + user prompt.
-# Measured prompt size: ~300-400 tokens. 2048 gives a safe 5× headroom.
-# Larger context = slightly more RAM but avoids GGML_ASSERT KV-cache overflow.
-LLM_N_CTX: int = 2048
- 
+
+# Number of parallel worker processes for LLM justification.
+# Each worker loads its own model copy. 4 workers × 2 threads = 8 threads total —
+# exactly saturates 8 physical cores without over-subscription.
+LLM_MAX_WORKERS: int = 4
+
+# llama_cpp threads *inside* each worker. Keep low when using multiple workers
+# so that total = LLM_MAX_WORKERS × LLM_N_THREADS_PER_WORKER ≤ physical cores.
+LLM_N_THREADS_PER_WORKER: int = 2
+
+# Context window. Measured prompt size: ~300-400 tokens.
+# 512 is a safe 1.5× headroom — far smaller than the old 2048, saving
+# ~75% KV-cache RAM per worker and cutting time-to-first-token noticeably.
+LLM_N_CTX: int = 512
+
 # Whether to run the LLM reranker. Set False to skip entirely (e.g. for tests).
 LLM_RERANKER_ENABLED: bool = True
- 
+
 # HuggingFace repo and filename used by LLMReranker.download_model()
 # Called only from precompute.py — never from rank.py
 LLM_HF_REPO_ID: str   = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"

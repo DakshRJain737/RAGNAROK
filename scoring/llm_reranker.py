@@ -40,16 +40,11 @@ _BANNED_OPENERS: tuple[str, ...] = (
 )
 
 _SYSTEM_PROMPT = (
-    "You are a technical recruiter writing a 2-sentence candidate brief. "
-    "Use ONLY the facts listed below — no invented claims. "
-    "Sentence 1: state the single most important fact (strength or risk) "
-    "specific to THIS candidate — name the exact skill, company, or number. "
-    "Do NOT open with 'The strongest signal that explains the position'. "
-    "Start directly with the fact (e.g. '82% skill match across FAISS...' or "
-    "'Inactive 120 days — availability unclear...'). "
-    "Sentence 2: give the key counterpoint or the KEY CONDITION that would change this assessment. "
-    "Be concise. No filler phrases."
-    "Both sentence combined must be less than 80 words (60 preferred)"
+    "Recruiter brief: 2 sentences, facts only, \u226460 words total. "
+    "S1: strongest single signal for this candidate — name exact skill, company, or number. "
+    "S2: key counterpoint or condition that would change this assessment. "
+    "Do NOT start with banned phrases like 'The strongest signal'. "
+    "Start directly with the fact (e.g. '82% skill match\u2026' or 'Inactive 120 days\u2026')."
 )
 
 _USER_TEMPLATE = """\
@@ -204,7 +199,7 @@ def _pool_infer(task: tuple) -> tuple[str, str]:
         out = _worker_llm.create_chat_completion(
             messages=messages,
             temperature=0.4,
-            max_tokens=100,
+            max_tokens=80,
             stop=["\n\n", "Sentence 3", "3.", "\nJob:"],
         )
         text = out["choices"][0]["message"]["content"].strip()
@@ -411,9 +406,10 @@ class LLMReranker:
         # ── Dispatch to process pool ──────────────────────────────────────
         # imap_unordered streams results back as soon as any worker finishes,
         # so we can log progress without waiting for the whole batch.
-        # chunksize hands each worker several tasks at once, reducing IPC
-        # overhead. Aim for ~4 chunks per worker.
-        chunksize = max(1, math.ceil(len(tasks) / (self._num_workers * 4)))
+        # One chunk per worker minimises IPC round-trips for small batches
+        # (50 tasks / 4 workers = ~13 tasks/chunk, far better than the old
+        # ceil(tasks / workers*4) which produced chunks of 3–4).
+        chunksize = max(1, math.ceil(len(tasks) / self._num_workers))
 
         completed = 0
         for cid, justification in self._pool.imap_unordered(

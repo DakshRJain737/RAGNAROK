@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import config
@@ -71,69 +73,65 @@ class PipelineRunner:
         # Indexes are now loaded lazily inside the paths via from_disk()
         timings["load_indexes"] = (time.perf_counter() - t0) * 1000
 
-        # ── 3. Run 5 retrieval paths ──────────────────────────────────────
+        # ── 3. Run 5 retrieval paths IN PARALLEL ─────────────────────
+        # Each path loads its own index and runs independently;
+        # no shared state between paths, so threads are safe here.
+        # Expected speedup: ~3-5x over serial (disk I/O + scoring overlap).
         t0 = time.perf_counter()
-        all_retrieval_results = []
-        path_results = {}
+        path_results: dict[str, list] = {}
+        path_errors: dict[str, Exception] = {}
 
-        # Path 1: Semantic (FAISS)
-        try:
+        def _run_semantic():
             from retrieval.semantic_path import SemanticPath
             sp = SemanticPath.from_disk()
-            res = sp.retrieve(self._jd, top_k=config.SEMANTIC_PATH_TOP_K)
-            path_results["semantic"] = res
-            all_retrieval_results.extend(res)
-        except Exception as e:
-            logger.error("Semantic path failed: %s", e)
-            raise RuntimeError(f"Semantic path failed: {e}") from e
+            return "semantic", sp.retrieve(self._jd, top_k=config.SEMANTIC_PATH_TOP_K)
 
-        # Path 2: Keyword (BM25)
-        try:
+        def _run_keyword():
             from retrieval.keyword_path import KeywordPath
             kp = KeywordPath.from_disk()
-            res = kp.retrieve(self._jd, top_k=config.KEYWORD_PATH_TOP_K)
-            path_results["keyword"] = res
-            all_retrieval_results.extend(res)
-        except Exception as e:
-            logger.error("Keyword path failed: %s", e)
-            raise RuntimeError(f"Keyword path failed: {e}") from e
+            return "keyword", kp.retrieve(self._jd, top_k=config.KEYWORD_PATH_TOP_K)
 
-        # Path 3: Ontology
-        try:
+        def _run_ontology():
             from retrieval.ontology_path import OntologyPath
             op = OntologyPath.from_skill_map()
             skills_map = OntologyPath.build_skills_map(self._candidates)
-            res = op.retrieve(self._jd, candidate_skills_map=skills_map, top_k=config.ONTOLOGY_PATH_TOP_K)
-            path_results["ontology"] = res
-            all_retrieval_results.extend(res)
-        except Exception as e:
-            logger.error("Ontology path failed: %s", e)
-            raise RuntimeError(f"Ontology path failed: {e}") from e
+            return "ontology", op.retrieve(self._jd, candidate_skills_map=skills_map, top_k=config.ONTOLOGY_PATH_TOP_K)
 
-        # Path 4: Trajectory
-        try:
+        def _run_trajectory():
             from retrieval.trajectory_path import TrajectoryPath
             tp = TrajectoryPath.from_disk()
-            res = tp.retrieve(self._jd, top_k=config.TRAJECTORY_PATH_TOP_K)
-            path_results["trajectory"] = res
-            all_retrieval_results.extend(res)
-        except Exception as e:
-            logger.error("Trajectory path failed: %s", e)
-            raise RuntimeError(f"Trajectory path failed: {e}") from e
+            return "trajectory", tp.retrieve(self._jd, top_k=config.TRAJECTORY_PATH_TOP_K)
 
-        # Path 5: Signal (behavioral)
-        try:
+        def _run_signal():
             from retrieval.signal_path import SignalPath
             sigp = SignalPath.from_disk()
-            res = sigp.retrieve(top_k=config.SIGNAL_PATH_TOP_K)
-            path_results["signal"] = res
-            all_retrieval_results.extend(res)
-        except Exception as e:
-            logger.error("Signal path failed: %s", e)
-            raise RuntimeError(f"Signal path failed: {e}") from e
+            return "signal", sigp.retrieve(top_k=config.SIGNAL_PATH_TOP_K)
 
+        _retrieval_fns = [_run_semantic, _run_keyword, _run_ontology, _run_trajectory, _run_signal]
+        _REQUIRED_PATHS = {"semantic", "keyword", "ontology", "trajectory", "signal"}
+
+        with ThreadPoolExecutor(max_workers=5, thread_name_prefix="retrieval") as exe:
+            futures = {exe.submit(fn): fn.__name__ for fn in _retrieval_fns}
+            for fut in as_completed(futures):
+                fname = futures[fut]
+                try:
+                    path_name, res = fut.result()
+                    path_results[path_name] = res
+                    logger.debug("Retrieval path '%s': %d results", path_name, len(res))
+                except Exception as exc:
+                    path_errors[fname] = exc
+                    logger.error("Retrieval path '%s' failed: %s", fname, exc)
+
+        # Raise on any critical path failure
+        for fname, exc in path_errors.items():
+            raise RuntimeError(f"Retrieval path {fname} failed: {exc}") from exc
+
+        all_retrieval_results = [r for res in path_results.values() for r in res]
         timings["retrieval_paths"] = (time.perf_counter() - t0) * 1000
-        logger.info("Retrieval: %d total results across all paths", len(all_retrieval_results))
+        logger.info(
+            "Retrieval: %d total results across %d paths (parallel)",
+            len(all_retrieval_results), len(path_results),
+        )
 
         # ── 4. RRF Fusion ─────────────────────────────────────────────────
         t0 = time.perf_counter()
@@ -152,8 +150,36 @@ class PipelineRunner:
         rrf_pool = [r for r in rrf_pool if r.candidate_id not in honeypot_ids]
         rrf_pool = rrf_pool[:config.CROSS_ENCODER_TOP_K]
 
-        # ── 5. Cross-encoder rerank ───────────────────────────────────────
+        # ── 5. Cross-encoder rerank + LLM pool pre-warm (overlapped) ──────
+        # Spawn the LLM worker pool in a background thread NOW so model
+        # loading (~15-30s) overlaps with cross-encoder scoring.
+        # By the time we reach step 8 the pool is already hot.
         t0 = time.perf_counter()
+        _llm_reranker_ref: list = []  # mutable container so thread can write
+        _llm_preload_error: list = []  # capture any preload exception
+
+        def _preload_llm():
+            if not getattr(config, "LLM_RERANKER_ENABLED", True):
+                return
+            try:
+                from scoring.llm_reranker import LLMReranker
+                reranker = LLMReranker(
+                    model_path=config.LLM_MODEL_PATH,
+                    n_ctx=getattr(config, "LLM_N_CTX", 512),
+                    max_workers=getattr(config, "LLM_MAX_WORKERS", 4),
+                    n_threads_per_worker=getattr(config, "LLM_N_THREADS_PER_WORKER", 2),
+                )
+                reranker.preload()  # blocks until all workers are warm
+                _llm_reranker_ref.append(reranker)
+                logger.info("LLM: pool pre-warmed in background thread.")
+            except Exception as exc:
+                _llm_preload_error.append(exc)
+                logger.warning("LLM pre-warm failed (will retry inline): %s", exc)
+
+        _llm_thread = threading.Thread(target=_preload_llm, name="llm-preload", daemon=True)
+        _llm_thread.start()
+        logger.info("LLM: pool pre-warm started in background — overlapping with cross-encoder.")
+
         try:
             from scoring.cross_encoder import CrossEncoderReranker
             ce = CrossEncoderReranker()
@@ -227,11 +253,26 @@ class PipelineRunner:
             from scoring.skill_match import SkillMatchScorer
             from scoring.career_quality import CareerQualityScorer
 
-            skill_results = SkillMatchScorer().score_all(top_candidates, self._jd)
-            career_results = CareerQualityScorer(self._jd).score_all(top_candidates)
-            # Reuse the already-computed behavioral scorer instance from step 6
-            # to avoid rescoring the same candidates a second time.
-            behavioral_results = _behavioral_scorer_instance.score_all(top_candidates)
+            # ── Run 3 independent scorers in parallel ──────────────────────
+            # SkillMatch, CareerQuality, Behavioral each iterate over top-100
+            # independently — no shared mutable state. 3-worker pool gives ~3x
+            # speedup on the trust-layer scoring phase (~8s → ~3s).
+            def _score_skills():
+                return SkillMatchScorer().score_all(top_candidates, self._jd)
+
+            def _score_career():
+                return CareerQualityScorer(self._jd).score_all(top_candidates)
+
+            def _score_behavioral():
+                return _behavioral_scorer_instance.score_all(top_candidates)
+
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="trust") as tex:
+                f_skill = tex.submit(_score_skills)
+                f_career = tex.submit(_score_career)
+                f_behavioral = tex.submit(_score_behavioral)
+                skill_results = f_skill.result()
+                career_results = f_career.result()
+                behavioral_results = f_behavioral.result()
 
             for rank_pos, cs in enumerate(composite_results[:top_k], start=1):
                 cid = cs.candidate_id
@@ -301,14 +342,35 @@ class PipelineRunner:
 
         timings["trust_layer"] = (time.perf_counter() - t0) * 1000
 
-        # ── 8. LLM Justification layer (last step — reasoning only, no score change) ──
-        # Runs AFTER composite scores are finalised. Generates a 1-sentence
-        # human-readable justification for each top-100 candidate.
-        # Falls back to rule-based reasoning on any model error.
+        # ── 8. LLM Justification layer ─────────────────────────────────
+        # Pool was pre-warmed in the background thread during step 5 (CE).
+        # We just join the thread to make sure pre-warm is complete, then
+        # dispatch tasks immediately — no model-load wait here.
         t0 = time.perf_counter()
         try:
             if getattr(config, "LLM_RERANKER_ENABLED", True):
-                from scoring.llm_reranker import LLMReranker
+                # Wait for the pre-warm thread to finish (usually already done).
+                _llm_thread.join()
+
+                if _llm_preload_error and not _llm_reranker_ref:
+                    # Pre-warm failed; try a fresh inline load as fallback.
+                    logger.warning(
+                        "LLM pre-warm failed earlier: %s — retrying inline.",
+                        _llm_preload_error[0],
+                    )
+                    from scoring.llm_reranker import LLMReranker
+                    _inline_reranker = LLMReranker(
+                        model_path=config.LLM_MODEL_PATH,
+                        n_ctx=getattr(config, "LLM_N_CTX", 512),
+                        max_workers=getattr(config, "LLM_MAX_WORKERS", 4),
+                        n_threads_per_worker=getattr(config, "LLM_N_THREADS_PER_WORKER", 2),
+                    )
+                    _llm_reranker_ref.append(_inline_reranker)
+
+                if not _llm_reranker_ref:
+                    raise RuntimeError("LLM reranker could not be initialised.")
+
+                llm_reranker = _llm_reranker_ref[0]
 
                 top100_cfvs = [
                     self._candidate_store[cs.candidate_id]
@@ -319,19 +381,12 @@ class PipelineRunner:
                     cs.candidate_id: (pos + 1)
                     for pos, cs in enumerate(composite_results[:top_k])
                 }
-
-                llm_reranker = LLMReranker(
-                    model_path=config.LLM_MODEL_PATH,
-                    n_threads=getattr(config, "LLM_N_THREADS", 8),
-                    n_ctx=getattr(config, "LLM_N_CTX", 512),
-                )
-                llm_top_n = getattr(config, "LLM_RERANKER_TOP_N", 60)
+                llm_top_n = getattr(config, "LLM_RERANKER_TOP_N", 50)
                 logger.info(
-                    "LLM: will run inference for top-%d candidates; "
-                    "ranks %d–%d use rule-based reasoning.",
+                    "LLM: dispatching top-%d candidates (pool already warm);"
+                    " ranks %d–%d use rule-based reasoning.",
                     llm_top_n, llm_top_n + 1, top_k,
                 )
-                # Build composite score lookup from the already-normalised results.
                 composite_scores_map: dict[str, float] = {
                     cs.candidate_id: cs.final_score
                     for cs in composite_results[:top_k]
@@ -340,16 +395,16 @@ class PipelineRunner:
                     candidates=top100_cfvs,
                     jd=self._jd,
                     ranks=ranks_map,
-                    trust_verdicts=dict(trust_verdicts),  # advocate/skeptic signals
-                    fallbacks=dict(reasonings),           # rule-based as fallback
+                    trust_verdicts=dict(trust_verdicts),
+                    fallbacks=dict(reasonings),
                     top_n=llm_top_n,
                     composite_scores=composite_scores_map,
                 )
-                # Override rule-based reasoning with LLM output where available
                 for cid, justification in llm_justifications.items():
                     if justification:
                         reasonings[cid] = justification
 
+                llm_reranker.shutdown()
                 logger.info(
                     "LLM: justified %d/%d top candidates.",
                     len(llm_justifications), top_k,

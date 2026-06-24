@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # requirements.txt — Redrob Candidate Ranking System
-# Python 3.12 · CPU-only · No GPU · No network during ranking
+# Python 3.11.2 · CPU-only · No GPU · No network during ranking
 #
 # Install: pip install -r requirements.txt
 #

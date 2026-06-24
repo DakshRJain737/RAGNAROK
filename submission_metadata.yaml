@@ -43,15 +43,15 @@ reproduce_command: "python rank.py --candidates ./candidates.jsonl --out ./submi
 # Compute environment
 # ============================================================================
 compute:
-  platform: "MacBook Pro M2"                    # Or: "AWS EC2 c5.4xlarge", "Local Linux box", etc.
+  platform: "Lenovo ideapad i5"                    # Or: "AWS EC2 c5.4xlarge", "Local Linux box", etc.
   cpu_cores: 8                                  # Number of CPU cores used
   ram_gb: 16                                    # Available RAM in GB
-  python_version: "3.11.4"                      # python --version
-  os: "macOS 14.2"                              # Or "Ubuntu 22.04 LTS", etc.
+  python_version: "3.11.2"                      # python --version
+  os: "Windows 12"                              # Or "Ubuntu 22.04 LTS", etc.
   uses_gpu_for_inference: false                 # Must be false — see compute constraints
   has_network_during_ranking: false             # Must be false — no API calls during ranking
-  pre_computation_required: false               # true if you pre-compute embeddings or train models offline
-  pre_computation_time_minutes: 0               # Approximate, if applicable
+  pre_computation_required: true               # true if you pre-compute embeddings or train models offline
+  pre_computation_time_minutes: 60 min               # Approximate, if applicable
 
 # ============================================================================
 # AI tools declaration
@@ -80,8 +80,8 @@ methodology_summary: |
   (e.g. RecSys → IR) won't surface via keyword or dense search alone. Path 3 walks a hand-crafted
   ontology graph to rescue these Tier-5 profiles. Path 5 eliminates unreachable candidates early
   via engagement signals before the expensive cross-encoder runs.
-  Composite scoring weights skill match (0.40), career quality (0.35), and behavioral availability
-  (0.25). Career quality applies a hard 0.35× penalty for consulting-only backgrounds (TCS/Wipro/Infosys etc.)
+  Composite scoring weights skill match (0.40), career quality (0.30), and behavioral availability
+  (0.20) trajectory(0.10). Career quality applies a hard 0.30× penalty for consulting-only backgrounds (TCS/Wipro/Infosys etc.)
   and a 1.20× bonus for product-company experience, directly reflecting the JD's stated disqualifiers.
   Honeypot detection uses five pre-computed rules (founding-date delta, expert-with-zero-duration,
   salary anomaly, skills stuffing, YOE discrepancy) cached as an O(1) registry — filtered before
