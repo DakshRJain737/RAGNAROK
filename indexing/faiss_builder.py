@@ -199,7 +199,7 @@ class FaissIndex:
         """Lazy-load and cache the sentence transformer model."""
         if self._model is None:
             logger.info("Loading sentence transformer: %s", self.model_name)
-            self._model = SentenceTransformer(self.model_name, device="cpu")
+            self._model = SentenceTransformer(self.model_name, device="cpu", local_files_only=True)
         return self._model
 
     # ── Guards ────────────────────────────────────────────────────────────────

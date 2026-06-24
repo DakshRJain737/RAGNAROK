@@ -29,7 +29,8 @@ CAND_0081852,20,0.766528,"**STRENGTHS**
 - LLM Systems cluster coverage: 80% across 100% of capabilities with Haystack, LoRA."
 CAND_0036437,21,0.763065,"STRENGTHS: 97% coverage of retrieval systems and 98% of production ML clusters, with 4.8 years of experience. RISKS: Inactivity for 5 weeks, 58% skill coverage below ideal threshold. KEY CONDITION: Verify candidate is actively looking for job openings."
 CAND_0009691,22,0.762688,"Candidate has strong production ML cluster coverage and extensive experience in LLM systems, but lacks product-company experience and a long notice period, which significantly impacts the assessment."
-CAND_0076163,23,0.760090,"STRENGTHS: 92% retrieval systems coverage, 84% production ML cluster coverage. RISKS: Inactivity for 45 days, low exposure to out-of-domain skills. KEY CONDITION: Verify active engagement."
+CAND_0076163,23,0.760090,"STRENGTHS: 92% retrieval system cluster coverage and 84% production ML cluster coverage, with 6.9 years of experience.  
+KEY CONDITION: Inactivity proves permanent, verify candidate is actively looking."
 CAND_0026532,24,0.754839,"Candidate has strong skills in retrieval and ranking, with a solid but with gaps composite score of 0.755. However, the candidate's platform inactivity (last active ~2 month(s) ago) is a key counterpoint, which may affect their ability to meet the job requirements."
 CAND_0036184,25,0.753549,"STRENGTHS: 79% cluster coverage in retrieval systems and 94% in production ML, with robust skills in embeddings, FAISS, Hugging Face Transformers, LangChain, Pinecone, PyTorch, Semantic Search, Sentence Transformers.
 KEY CONDITION: The candidate's skills are notably weakened due to a domain mismatch, requiring an inter"

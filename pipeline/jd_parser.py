@@ -820,6 +820,7 @@ class JDParser:
                 self._encoder = SentenceTransformer(
                     self._encoder_model_name,
                     device="cpu",
+                    local_files_only=True,
                 )
                 logger.info(
                     "Bi-encoder loaded: %s (CPU-only)", self._encoder_model_name
