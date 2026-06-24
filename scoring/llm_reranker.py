@@ -1,27 +1,26 @@
 from __future__ import annotations
 
 import logging
-import queue
-import threading
+import math
+import multiprocessing as mp
+import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import islice
 from typing import Optional
 
-from pipeline.schemas import JDIntent, CandidateFeatureVector, TrustVerdict, ComponentScores
+from pipeline.schemas import JDIntent, CandidateFeatureVector, TrustVerdict
 
 logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Signal serialisation helpers
+# Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SIGNAL_VAL_MAX: int = 120
 _ADVOCATE_SIGNALS_IN_PROMPT: int = 3
 _SKEPTIC_SIGNALS_IN_PROMPT: int = 2
 
-# FIX 7: strip prefixes as a tuple constant so `startswith` uses the fast C path
 _FALSIFIABILITY_PREFIXES: tuple[str, ...] = (
     "This ranking holds UNLESS ",
     "This ranking becomes MORE ROBUST if ",
@@ -40,9 +39,33 @@ _BANNED_OPENERS: tuple[str, ...] = (
     "The key strength is the candidate",
 )
 
+_SYSTEM_PROMPT = (
+    "You are a technical recruiter writing a 2-sentence candidate brief. "
+    "Use ONLY the facts listed below — no invented claims. "
+    "Sentence 1: state the single most important fact (strength or risk) "
+    "specific to THIS candidate — name the exact skill, company, or number. "
+    "Do NOT open with 'The strongest signal that explains the position'. "
+    "Start directly with the fact (e.g. '82% skill match across FAISS...' or "
+    "'Inactive 120 days — availability unclear...'). "
+    "Sentence 2: give the key counterpoint or the KEY CONDITION that would change this assessment. "
+    "Be concise. No filler phrases."
+    "Both sentence combined must be less than 80 words (60 preferred)"
+)
+
+_USER_TEMPLATE = """\
+Job: Senior AI Eng | 5-9yr | product-co | retrieval/ranking skills
+Rank #{rank} of 100 | {tier} | {verdict} ({confidence}% confidence)
+Candidate: {yoe}yr exp | composite score {composite:.3f}
+Facts:
+{signal_block}
+Brief:"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pure helpers (picklable — called in worker processes)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _smart_truncate(value: str, max_len: int) -> str:
-    # FIX 6: early-exit before any work when string is already short enough
     if len(value) <= max_len:
         return value
     sliced = value[:max_len].rstrip()
@@ -55,7 +78,6 @@ def _smart_truncate(value: str, max_len: int) -> str:
 def _build_signal_block(trust: TrustVerdict) -> str:
     lines: list[str] = []
 
-    # FIX 7: islice avoids allocating a new list just to take the first N items
     adv_signals = list(islice(trust.advocate_signals, _ADVOCATE_SIGNALS_IN_PROMPT))
     if adv_signals:
         lines.append("STRENGTHS")
@@ -96,43 +118,12 @@ def _tier_label(rank: int) -> str:
     return "bottom-tier — poor fit"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Prompt constants
-# ─────────────────────────────────────────────────────────────────────────────
-
-_SYSTEM_PROMPT = (
-    "You are a technical recruiter writing a 2-sentence candidate brief. "
-    "Use ONLY the facts listed below — no invented claims. "
-    "Sentence 1: state the single most important fact (strength or risk) "
-    "specific to THIS candidate — name the exact skill, company, or number. "
-    "Do NOT open with 'The strongest signal that explains the position'. "
-    "Start directly with the fact (e.g. '82% skill match across FAISS...' or "
-    "'Inactive 120 days — availability unclear...'). "
-    "Sentence 2: give the key counterpoint or the KEY CONDITION that would change this assessment. "
-    "Be concise. No filler phrases."
-    "Both sentence combined must be less than 80 words (60 preferred)"
-)
-
-_USER_TEMPLATE = """\
-Job: Senior AI Eng | 5-9yr | product-co | retrieval/ranking skills
-Rank #{rank} of 100 | {tier} | {verdict} ({confidence}% confidence)
-Candidate: {yoe}yr exp | composite score {composite:.3f}
-Facts:
-{signal_block}
-Brief:"""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Prompt builder (pure, no I/O — safe to parallelise)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _build_messages(
     rank: int,
     trust: TrustVerdict,
     candidate: Optional[CandidateFeatureVector],
     composite_score: float,
 ) -> list[dict]:
-    """Build the chat message list without touching the LLM. Thread-safe."""
     signal_block = _build_signal_block(trust)
     tier = _tier_label(rank)
     yoe = f"{candidate.years_of_experience:.1f}" if candidate else "?"
@@ -152,11 +143,109 @@ def _build_messages(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Process-pool worker
+#
+# Each worker process holds its own Llama instance in a module-level global.
+# This means:
+#   • No lock needed — one model per process, calls are already serial per worker.
+#   • True parallelism — N workers run N inferences simultaneously on N CPU cores.
+#   • Memory cost — each worker loads the full model (~1–4 GB depending on quant).
+#     Use num_workers=2 if RAM is tight; 4 if you have ≥16 GB free.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Module-level: one per worker process, never shared across processes.
+_worker_llm = None
+_worker_logger = None
+
+
+def _pool_initializer(
+    model_path: str,
+    n_ctx: int,
+    n_threads: int,
+    verbose: bool,
+) -> None:
+    """
+    Called once when each worker process starts.
+    Loads the GGUF model into _worker_llm for this process only.
+    n_threads here refers to threads *within* one llama_cpp instance —
+    keep this low (1–2) when running multiple workers so cores aren't
+    over-subscribed.
+    """
+    global _worker_llm, _worker_logger
+    _worker_logger = logging.getLogger(__name__)
+
+    from llama_cpp import Llama
+    pid = os.getpid()
+    _worker_logger.info("Worker PID %d: loading model …", pid)
+    t0 = time.perf_counter()
+    _worker_llm = Llama(
+        model_path=model_path,
+        n_ctx=n_ctx,
+        n_threads=n_threads,
+        verbose=verbose,
+        use_mlock=False,
+    )
+    _worker_logger.info("Worker PID %d: model ready in %.2fs", pid, time.perf_counter() - t0)
+
+
+def _pool_infer(task: tuple) -> tuple[str, str]:
+    """
+    Called per candidate in a worker process.
+    task = (candidate_id, messages, fallback)
+    Returns (candidate_id, justification_text).
+    """
+    cid, messages, fallback = task
+
+    if _worker_llm is None:
+        # Should never happen if initializer ran, but be defensive.
+        return cid, fallback
+
+    try:
+        out = _worker_llm.create_chat_completion(
+            messages=messages,
+            temperature=0.4,
+            max_tokens=100,
+            stop=["\n\n", "Sentence 3", "3.", "\nJob:"],
+        )
+        text = out["choices"][0]["message"]["content"].strip()
+
+        if len(text) < 30 or any(text.startswith(p) for p in _BANNED_OPENERS):
+            if _worker_logger:
+                _worker_logger.debug(
+                    "Worker: output rejected (short/banned): %r", text[:80]
+                )
+            return cid, fallback
+
+        return cid, text[:320]
+
+    except Exception as exc:
+        if _worker_logger:
+            _worker_logger.debug("Worker: inference failed for %s: %s", cid, exc)
+        return cid, fallback
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main class
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LLMReranker:
-    """Local GGUF LLM used exclusively for post-ranking justification."""
+    """
+    Local GGUF LLM used exclusively for post-ranking justification.
+
+    Uses a multiprocessing Pool so each worker process holds its own Llama
+    instance. This gives true CPU parallelism — N workers run N inferences
+    simultaneously — unlike threads which are serialised by llama_cpp's
+    internal locking and Python's GIL.
+
+    Memory note:
+        Each worker loads the full model file. A Q4_K_M 7B model ≈ 4 GB.
+        With num_workers=4 that's ~16 GB RAM. Use num_workers=2 if tight.
+
+    n_threads_per_worker:
+        Threads inside each llama_cpp instance. Keep at 1–2 when running
+        multiple workers — the total thread count is num_workers × this,
+        and over-subscribing cores hurts throughput. Default 2.
+    """
 
     @staticmethod
     def download_model(repo_id: str, filename: str, local_dir: str) -> None:
@@ -167,90 +256,86 @@ class LLMReranker:
     def __init__(
         self,
         model_path: str,
-        n_threads: int = 4,
+        n_threads: int = 4,            # kept for API compat; see n_threads_per_worker
         n_ctx: int = 512,
         verbose: bool = False,
-        max_workers: int = 4,
+        max_workers: int = 4,          # number of parallel worker processes
+        n_threads_per_worker: int = 2, # llama_cpp threads inside each worker
     ) -> None:
         self._model_path = model_path
-        self._n_threads = n_threads
         self._n_ctx = n_ctx
         self._verbose = verbose
-        self._max_workers = max_workers
-        self._llm = None
-        # FIX 5: use an RLock so the same thread can re-enter (e.g. preload → _load)
-        # and a separate load-guard event so callers don't spin-wait on the load itself
-        self._infer_lock = threading.Lock()   # serialises llama_cpp inference calls
-        self._load_lock = threading.Lock()    # prevents concurrent model loads
-        self._loaded = threading.Event()      # lets waiters block cheaply
+        self._num_workers = max_workers
+        # Each worker uses n_threads_per_worker internal threads.
+        # If not explicitly set, derive from n_threads for back-compat:
+        # spread n_threads evenly across workers, minimum 1.
+        self._n_threads_per_worker = n_threads_per_worker or max(1, n_threads // max_workers)
+
+        self._pool: Optional[mp.pool.Pool] = None
+        self._pool_ctx = mp.get_context("spawn")  # spawn is safe on all platforms
+
+    # ── Pool lifecycle ────────────────────────────────────────────────────
 
     def preload(self) -> None:
         """
-        Eagerly load the GGUF model into memory.
+        Start worker processes and load the model in each one.
 
-        Call this once at pipeline startup so the model is warm before any
-        candidates arrive. Calling it again is a no-op. Thread-safe.
+        Call at pipeline startup. Workers stay alive between calls to
+        justify_candidates so the model never needs to reload mid-pipeline.
+        Call shutdown() during teardown, or use as a context manager.
         """
-        self._load()
-
-    def _load(self) -> None:
-        # FIX 5: double-checked locking — cheap fast path once loaded
-        if self._loaded.is_set():
+        if self._pool is not None:
             return
-        with self._load_lock:
-            if self._loaded.is_set():   # re-check after acquiring lock
-                return
-            from llama_cpp import Llama
-            logger.info("Loading LLM for justification …")
-            t0 = time.perf_counter()
-            self._llm = Llama(
-                model_path=self._model_path,
-                n_ctx=self._n_ctx,
-                n_threads=self._n_threads,
-                verbose=self._verbose,
-                use_mlock=False,
-            )
-            logger.info("LLM loaded in %.2fs", time.perf_counter() - t0)
-            self._loaded.set()   # unblocks any thread waiting in _ensure_loaded
 
-    def _ensure_loaded(self) -> None:
-        """Block until the model is ready. Safe to call from any thread."""
-        if not self._loaded.is_set():
-            self._load()            # first caller does the work
-            self._loaded.wait()     # others wait here (no busy loop)
+        logger.info(
+            "LLM: starting %d worker processes (n_threads_per_worker=%d) …",
+            self._num_workers,
+            self._n_threads_per_worker,
+        )
+        t0 = time.perf_counter()
 
-    # ── Core inference ─────────────────────────────────────────────────────
+        self._pool = self._pool_ctx.Pool(
+            processes=self._num_workers,
+            initializer=_pool_initializer,
+            initargs=(
+                self._model_path,
+                self._n_ctx,
+                self._n_threads_per_worker,
+                self._verbose,
+            ),
+        )
 
-    def _infer(self, messages: list[dict], fallback: str) -> str:
-        """
-        Run one inference call. Serialised via _infer_lock because
-        llama_cpp.Llama is not thread-safe, but prompt *building* is done
-        outside this method so threads can prepare prompts in parallel.
-        """
-        try:
-            # FIX 1: the lock now wraps ONLY the inference call, not prompt
-            # building or post-processing, so threads genuinely run in parallel
-            # for everything except the unavoidably serial GPU/CPU work.
-            with self._infer_lock:
-                out = self._llm.create_chat_completion(
-                    messages=messages,
-                    temperature=0.4,
-                    max_tokens=100,
-                    stop=["\n\n", "Sentence 3", "3.", "\nJob:"],
-                )
-            text = out["choices"][0]["message"]["content"].strip()
+        # Warm all workers with a trivial ping so startup is paid at preload
+        # time, not during the first real batch.
+        dummy = [("__warmup__", [], "__warmup__")] * self._num_workers
+        self._pool.map(_pool_infer, dummy)
 
-            if len(text) < 30 or any(text.startswith(p) for p in _BANNED_OPENERS):
-                logger.debug("LLM output rejected (too short or banned opener): %r", text[:80])
-                return fallback
+        logger.info(
+            "LLM: all %d workers ready in %.2fs",
+            self._num_workers,
+            time.perf_counter() - t0,
+        )
 
-            return text[:320]
+    def shutdown(self) -> None:
+        """Terminate worker processes. Safe to call multiple times."""
+        if self._pool is not None:
+            self._pool.terminate()
+            self._pool.join()
+            self._pool = None
+            logger.info("LLM: worker pool shut down.")
 
-        except Exception as exc:
-            logger.debug("LLM _infer failed: %s", exc)
-            return fallback
+    def __enter__(self) -> "LLMReranker":
+        self.preload()
+        return self
 
-    # ── Batch justification (public API) ──────────────────────────────────
+    def __exit__(self, *_) -> None:
+        self.shutdown()
+
+    def _ensure_pool(self) -> None:
+        if self._pool is None:
+            self.preload()
+
+    # ── Batch justification (public API) ─────────────────────────────────
 
     def justify_candidates(
         self,
@@ -263,7 +348,7 @@ class LLMReranker:
         composite_scores: Optional[dict[str, float]] = None,
     ) -> dict[str, str]:
 
-        self._ensure_loaded()
+        self._ensure_pool()
 
         trust_verdicts = trust_verdicts or {}
         fallbacks = fallbacks or {}
@@ -278,10 +363,12 @@ class LLMReranker:
         results: dict[str, str] = {}
         t0 = time.perf_counter()
 
-        # ── Partition: skip list vs LLM batch ────────────────────────────
-        # Each LLM batch item carries (rank, cfv, fallback, messages)
-        # so threads can do prompt building in parallel before inference.
-        llm_batch: list[tuple[int, CandidateFeatureVector, str, list[dict]]] = []
+        # ── Build task list ───────────────────────────────────────────────
+        # Tasks sent to workers are plain tuples of picklable primitives.
+        # Pydantic/dataclass objects (CandidateFeatureVector, TrustVerdict)
+        # are consumed here in the main process to build the message dicts,
+        # which are plain Python dicts — cheaply picklable across the pipe.
+        tasks: list[tuple[str, list[dict], str]] = []
 
         for i, cfv in enumerate(candidates, start=1):
             cid = cfv.candidate_id
@@ -290,9 +377,7 @@ class LLMReranker:
             raw_fallback = fallbacks.get(cid)
             if raw_fallback is None:
                 logger.warning(
-                    "LLM: no fallback string for candidate %s (rank %d) — "
-                    "using generic placeholder; check that the trust layer "
-                    "produced a complete fallbacks dict.",
+                    "LLM: no fallback for candidate %s (rank %d) — using placeholder.",
                     cid,
                     rank,
                 )
@@ -309,75 +394,56 @@ class LLMReranker:
                 continue
 
             composite = _composite.get(cid, 0.0)
-
-            # FIX 1+2: build the prompt here (pure CPU work) so the thread
-            # pool does real parallelism for prompt construction, leaving
-            # only the serial llama_cpp call inside _infer.
             messages = _build_messages(rank, trust, cfv, composite)
-            llm_batch.append((rank, cfv, raw_fallback, messages))
+            tasks.append((cid, messages, raw_fallback))
 
         skipped_count = len(results)
         logger.info(
-            "LLM: generating signal-grounded justifications for %d candidates "
-            "(%d skipped via rule-based fallback) …",
-            len(llm_batch),
+            "LLM: dispatching %d candidates to %d workers (%d skipped) …",
+            len(tasks),
+            self._num_workers,
             skipped_count,
         )
 
-        if not llm_batch:
+        if not tasks:
             return results
 
-        llm_count = 0
+        # ── Dispatch to process pool ──────────────────────────────────────
+        # imap_unordered streams results back as soon as any worker finishes,
+        # so we can log progress without waiting for the whole batch.
+        # chunksize hands each worker several tasks at once, reducing IPC
+        # overhead. Aim for ~4 chunks per worker.
+        chunksize = max(1, math.ceil(len(tasks) / (self._num_workers * 4)))
 
-        # FIX 1: _run now only calls _infer (which holds the lock briefly)
-        # and does no prompt building — parallel threads overlap on the
-        # everything except the locked inference slice.
-        def _run(
-            args: tuple[int, CandidateFeatureVector, str, list[dict]]
-        ) -> tuple[str, str]:
-            _rank, cfv, fallback, messages = args
-            justification = self._infer(messages, fallback)
-            return cfv.candidate_id, justification
+        completed = 0
+        for cid, justification in self._pool.imap_unordered(
+            _pool_infer, tasks, chunksize=chunksize
+        ):
+            results[cid] = justification
+            completed += 1
 
-        with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
-            futures = {pool.submit(_run, args): args for args in llm_batch}
-            for future in as_completed(futures):
-                try:
-                    cid, justification = future.result()
-                    results[cid] = justification
-                    llm_count += 1
-
-                    if llm_count % 10 == 0:
-                        elapsed = time.perf_counter() - t0
-                        rate = llm_count / elapsed if elapsed > 0 else 1.0
-                        remaining = max(0, len(llm_batch) - llm_count)
-                        eta = remaining / rate if rate > 0 else 0.0
-                        logger.info(
-                            "LLM: %d/%d done | %d skipped (rule-based) | "
-                            "%.1fs elapsed | ETA %.0fs",
-                            llm_count,
-                            len(llm_batch),
-                            skipped_count,
-                            elapsed,
-                            eta,
-                        )
-                except Exception as exc:
-                    args = futures[future]
-                    cid = args[1].candidate_id
-                    fallback = args[2]
-                    logger.warning(
-                        "LLM: future failed for %s: %s — using fallback", cid, exc
-                    )
-                    results[cid] = fallback
-                    llm_count += 1
+            if completed % 10 == 0:
+                elapsed = time.perf_counter() - t0
+                rate = completed / elapsed if elapsed > 0 else 1.0
+                remaining = max(0, len(tasks) - completed)
+                eta = remaining / rate if rate > 0 else 0.0
+                logger.info(
+                    "LLM: %d/%d done | %d skipped | %.1fs elapsed | ETA %.0fs",
+                    completed,
+                    len(tasks),
+                    skipped_count,
+                    elapsed,
+                    eta,
+                )
 
         elapsed = time.perf_counter() - t0
         logger.info(
-            "LLM: justified %d candidates via LLM, %d via rule-based, "
-            "in %.1fs (%.2f s/LLM-candidate)",
-            llm_count,
+            "LLM: justified %d via workers, %d via fallback, in %.1fs "
+            "(%.2f s/candidate wall-clock, %.1f× speedup over serial)",
+            completed,
             skipped_count,
             elapsed,
-            elapsed / max(1, llm_count),
+            elapsed / max(1, completed),
+            (completed * (elapsed / max(1, completed)) * self._num_workers) / max(elapsed, 0.001),
         )
         return results
