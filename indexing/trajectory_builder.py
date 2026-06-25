@@ -17,10 +17,7 @@ class TrajectoryAnalyzer:
 
     @staticmethod
     def calculate_tenure_metrics(candidate: CandidateFeatureVector) -> tuple[float, float, float]:
-        """
-        Single pass over career history.
-        Returns: (avg_tenure_years, stability_score, job_hopper_flag)
-        """
+        
         history = candidate.career_history
         if not history:
             return 0.0, 0.0, 1.0
@@ -37,10 +34,7 @@ class TrajectoryAnalyzer:
 
     @staticmethod
     def analyze_career_history(candidate: CandidateFeatureVector) -> tuple[float, float]:
-        """
-        Single pass over career history for both consulting and product signals.
-        Returns: (consulting_only_flag, has_product_exp_flag)
-        """
+        
         history = candidate.career_history
         if not history:
             return 0.0, 0.0
@@ -116,9 +110,7 @@ class TrajectoryAnalyzer:
 
 
 class TrajectoryIndex:
-    """
-    Builds and saves the (N, 5) float32 matrix expected by trajectory_path.py.
-    """
+    
     def __init__(self, index_path: Path = None, ids_path: Path = None) -> None:
         self.index_path = index_path or config.TRAJECTORY_PATH
         self.ids_path = ids_path or config.TRAJECTORY_IDS_PATH

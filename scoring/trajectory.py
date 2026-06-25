@@ -11,13 +11,6 @@ from pipeline.schemas import CandidateFeatureVector, CareerEntry
 
 logger = logging.getLogger(__name__)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Title -> seniority level
-# ─────────────────────────────────────────────────────────────────────────────
-# Checked from the most senior tier down to the most junior; the first
-# keyword match wins. Anything unmatched defaults to _DEFAULT_LEVEL (a
-# generic individual-contributor role with no seniority modifier).
 _SENIORITY_KEYWORDS: list[tuple[int, tuple[str, ...]]] = [
     (5, ("chief", "ceo", "cto", "cfo", "coo", "vp", "vice president",
          "president", "founder", "co-founder", "director", "head of")),
@@ -33,7 +26,6 @@ _MIN_YEARS_FOR_RATE = 0.5
 
 
 def _seniority_level(title: str) -> int:
-    """Best-effort seniority tier (1-5, default 2) inferred from a job title."""
     t = title.lower()
     for level, keywords in _SENIORITY_KEYWORDS:
         if any(kw in t for kw in keywords):
@@ -42,15 +34,6 @@ def _seniority_level(title: str) -> int:
 
 
 def count_promotions(career_history: list[CareerEntry]) -> int:
-    """
-    Count seniority step-ups across a candidate's chronological career.
-
-    A "promotion" is any role whose inferred seniority tier is strictly
-    greater than the tier of the immediately preceding role — whether the
-    move was internal (same company) or external (job change with a title
-    bump). Lateral moves and same-or-lower tiers don't count. A single-role
-    history has no promotions by definition.
-    """
     if len(career_history) < 2:
         return 0
 
@@ -66,7 +49,6 @@ def count_promotions(career_history: list[CareerEntry]) -> int:
 
 
 def _effective_years(candidate: CandidateFeatureVector) -> float:
-    """years_of_experience, falling back to total_career_months, floored."""
     years = candidate.years_of_experience
     if years <= 0:
         years = candidate.total_career_months / 12.0
@@ -74,17 +56,10 @@ def _effective_years(candidate: CandidateFeatureVector) -> float:
 
 
 def promotions_per_year(candidate: CandidateFeatureVector) -> float:
-    """Raw promotion velocity: count_promotions / effective years."""
     return count_promotions(candidate.career_history) / _effective_years(candidate)
 
 
 def trajectory_velocity_score(rate: float) -> float:
-    """
-    Min-max normalise a promotions/year rate into [0, 1] using
-    config.TRAJECTORY_PROMOTIONS_PER_YEAR_{FLOOR,CAP}.
-
-    floor -> 0.0, cap -> 1.0, clipped at both ends.
-    """
     floor = config.TRAJECTORY_PROMOTIONS_PER_YEAR_FLOOR
     cap = config.TRAJECTORY_PROMOTIONS_PER_YEAR_CAP
     if cap <= floor:
@@ -105,14 +80,6 @@ class TrajectoryResult:
 
 
 class TrajectoryVelocityScorer:
-    """
-    Stateless career-velocity scorer.
-
-    score()      -> single-candidate result, percentile_rank=None
-    score_all()  -> batch result, with percentile_rank computed against the
-                     passed-in pool's promotions_per_year distribution.
-    """
-
     def score(self, candidate: CandidateFeatureVector) -> TrajectoryResult:
         years = _effective_years(candidate)
         n_promo = count_promotions(candidate.career_history)
@@ -126,12 +93,6 @@ class TrajectoryVelocityScorer:
         )
 
     def score_all(self, candidates: list[CandidateFeatureVector]) -> list[TrajectoryResult]:
-        """
-        Score every candidate, then attach `percentile_rank` (0-100): the
-        fraction of the pool with promotions_per_year <= this candidate's,
-        expressed as a percentage. A candidate at the top of the pool's
-        velocity distribution gets percentile_rank ~100.
-        """
         results = [self.score(c) for c in candidates]
         if not results:
             return results
@@ -144,4 +105,3 @@ class TrajectoryVelocityScorer:
             )
             for r in results
         ]
-

@@ -53,12 +53,6 @@ class ComponentScores:
 
 
 def _location_bonus(cfv: CandidateFeatureVector, jd: JDIntent) -> float:
-    """
-    Per-city bonus from config.PREFERRED_LOCATIONS, plus relocation bonus.
-
-    City match takes priority — relocation bonus is only added when the
-    candidate is NOT already in a preferred city (avoids double-counting).
-    """
     city = cfv.location_lower.strip()
     if city in _PREFERRED_LOCATIONS:
         return _PREFERRED_LOCATIONS[city]
@@ -93,10 +87,6 @@ class CompositeScorer:
         # runner.py already called bscorer.score_all() for behavioral ranking).
         self._behavioral = behavioral_scorer or BehavioralScorer()
 
-        # Lazy — built on first rank() call.
-        # SkillMatchScorer takes no constructor args (jd passed per-call);
-        # CareerQualityScorer requires jd upfront;
-        # TrajectoryVelocityScorer takes none at all.
         self._career_scorer:     Optional[CareerQualityScorer]     = None
         self._skill_scorer:      Optional[SkillMatchScorer]        = None
         self._trajectory_scorer: Optional[TrajectoryVelocityScorer] = None
@@ -110,7 +100,6 @@ class CompositeScorer:
 
         t0 = time.perf_counter()
 
-        # ── Resolve candidates ────────────────────────────────────────────
         pool_pairs: list[tuple[RRFResult, CandidateFeatureVector]] = []
         skipped: list[str] = []
         for result in pool:
@@ -265,12 +254,4 @@ def rank_candidates(
     candidate_store: Union[list[CandidateFeatureVector], dict[str, CandidateFeatureVector]],
     behavioral_scorer: Optional[BehavioralScorer] = None,
 ) -> list[ComponentScores]:
-    """
-    Convenience wrapper for pipeline/runner.py.
-
-    Pass behavioral_scorer if BehavioralScorer has already been run upstream
-    (runner.py calls it before composite) to avoid re-scoring.
-
-    NOTE: pool must have cross_encoder_score already set by cross_encoder.py.
-    """
     return CompositeScorer(jd, candidate_store, behavioral_scorer).rank(pool)

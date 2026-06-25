@@ -31,19 +31,7 @@ _INTERMEDIATE_SET = frozenset(("intermediate",))
 
 
 class FaissIndex:
-    """
-    Dense semantic FAISS index over a CandidateFeatureVector list.
-
-    Usage:
-        fi = FaissIndex()
-        fi.build(candidates, save=True)
-
-        fi = FaissIndex()
-        fi.load()
-        results = fi.search(query_text, top_k=100)
-        # → [("CAND_0000001", 0.91), ("CAND_0000042", 0.87), ...]
-    """
-
+    
     def __init__(
         self,
         model_name: str = MODEL_NAME,
@@ -59,13 +47,7 @@ class FaissIndex:
         self._id_map: Optional[list[str]] = None           # position → candidate_id
 
     def build(self, candidates: list[CandidateFeatureVector], save: bool = True) -> None:
-        """
-        Encode all candidates and build FAISS index.
-
-        Automatically selects:
-          - IndexIVFFlat when len(candidates) >= N_CLUSTERS  [production]
-          - IndexFlatIP  when len(candidates) <  N_CLUSTERS  [dev/testing]
-        """
+      
         if not candidates:
             raise ValueError("candidates list is empty — nothing to index.")
 
@@ -94,7 +76,6 @@ class FaissIndex:
             self._save(index, id_map)
 
     def load(self) -> None:
-        """Load pre-built index and id_map from disk."""
         if not self.index_path.exists():
             raise FileNotFoundError(
                 f"FAISS index not found at '{self.index_path}'. Run .build() first."
@@ -109,12 +90,7 @@ class FaissIndex:
         )
 
     def search(self, query_text: str, top_k: int = 100) -> list[tuple[str, float]]:
-        """
-        Semantic search over the index.
-
-        Returns:
-            list of (candidate_id, cosine_score) sorted by score descending
-        """
+       
         self._require_loaded()
 
         # Bind model to local — avoids repeated _get_model() attr chain in hot path
@@ -151,7 +127,6 @@ class FaissIndex:
     # ── Encoding ──────────────────────────────────────────────────────────────
 
     def _encode_batch(self, texts: list[str]) -> np.ndarray:
-        """Encode texts in batches, return float32 normalised embeddings."""
         model = self._get_model()
         logger.info("Encoding %d candidates (batch_size=%d)...", len(texts), BATCH_SIZE)
         embeddings = model.encode(
@@ -168,7 +143,6 @@ class FaissIndex:
 
     @staticmethod
     def _build_ivf_index(embeddings: np.ndarray) -> faiss.IndexIVFFlat:
-        """IVF256 index — fast approximate search for large pools."""
         quantizer = faiss.IndexFlatIP(EMBEDDING_DIM)
         index = faiss.IndexIVFFlat(
             quantizer, EMBEDDING_DIM, N_CLUSTERS, faiss.METRIC_INNER_PRODUCT
@@ -180,7 +154,6 @@ class FaissIndex:
 
     @staticmethod
     def _build_flat_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
-        """Exact flat index — for small datasets only."""
         index = faiss.IndexFlatIP(EMBEDDING_DIM)
         index.add(embeddings)
         return index
@@ -196,7 +169,6 @@ class FaissIndex:
     # ── Model cache ───────────────────────────────────────────────────────────
 
     def _get_model(self) -> SentenceTransformer:
-        """Lazy-load and cache the sentence transformer model."""
         if self._model is None:
             logger.info("Loading sentence transformer: %s", self.model_name)
             self._model = SentenceTransformer(self.model_name, device="cpu", local_files_only=True)

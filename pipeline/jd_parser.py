@@ -140,37 +140,13 @@ _MIN_REQUIRED_SKILLS: int = 8  # sprint acceptance criterion
 # ─────────────────────────────────────────────────────────────────────────────
 
 class JDParser:
-    """
-    Parses a job description into a fully-populated JDIntent.
-
-    Design principles:
-      - Single responsibility: text in, JDIntent out.
-      - spaCy is supplementary only. Vocabulary matching is the primary signal.
-      - Sentence-transformer model is lazy-loaded on first encode() call.
-      - JDIntent.embedding is None when encode=False  (unit-test friendly).
-      - Safety nets prevent the acceptance criterion from failing even when
-        section detection is imperfect.
-
-    Usage:
-        parser = JDParser()
-        intent = parser.parse(config.JD_PATH, encode=True)
-
-        # or from raw text (Streamlit / API path)
-        intent = parser.parse(jd_text_string, encode=True)
-    """
-
+    
     def __init__(
         self,
         skill_map_path: Optional[Path] = None,
         encoder_model: Optional[str] = None,
     ) -> None:
-        """
-        Args:
-            skill_map_path: Override path for skill_map.json. Defaults to
-                            config.SKILL_MAP_PATH.
-            encoder_model:  Override bi-encoder model name. Defaults to
-                            config.BI_ENCODER_MODEL.
-        """
+        
         effective_map_path = skill_map_path or config.SKILL_MAP_PATH
         self._encoder_model_name: str = encoder_model or config.BI_ENCODER_MODEL
         self._encoder = None  # lazy-loaded on first _encode() call
@@ -191,10 +167,7 @@ class JDParser:
     # ------------------------------------------------------------------ #
 
     def load_parsed(self, parsed_path: Optional[Path] = None, encode: bool = True) -> JDIntent:
-        """
-        Load a pre-parsed JDIntent from a JSON file.
-        Skips NLP parsing but can run bi-encoder embedding if encode=True.
-        """
+       
         path = parsed_path or (config.PROJECT_ROOT / "parsed_job_description.json")
         if not path.exists():
             raise FileNotFoundError(f"Parsed JD not found at '{path}'")
@@ -216,30 +189,7 @@ class JDParser:
         jd_source: Union[str, Path],
         encode: bool = True,
     ) -> JDIntent:
-        """
-        Parse a job description into a structured JDIntent.
-
-        Args:
-            jd_source: Either:
-                       - Raw JD text (str), e.g. from Streamlit text_area.
-                       - Path to a plain-text or .md file (e.g. config.JD_PATH).
-                       NOTE: .docx is not supported directly. Extract text
-                       first, or pass the file as text after python-docx
-                       extraction. The provided job_description.docx is
-                       readable as plain text so Path(…).read_text() works.
-            encode:    If True, call the sentence-transformer bi-encoder to
-                       populate JDIntent.embedding (384-dim MiniLM vector).
-                       Set False in unit tests to skip the 22 MB model load.
-
-        Returns:
-            JDIntent with all fields populated and validated.
-
-        Raises:
-            FileNotFoundError: jd_source is a Path that does not exist.
-            TypeError:         jd_source is neither str nor Path.
-            RuntimeError:      encode=True but sentence_transformers is not
-                               installed or model not cached locally.
-        """
+        
         raw_text: str = self._load_text(jd_source)
         text: str = self._clean_text(raw_text)
         sections: dict[str, str] = self._split_sections(text)
@@ -330,12 +280,7 @@ class JDParser:
 
     @staticmethod
     def _clean_text(text: str) -> str:
-        """
-        Strip markdown formatting markers while preserving structure.
-
-        Newlines are kept so section-header detection still works.
-        En-dash / em-dash are normalised to ASCII hyphen for regex uniformity.
-        """
+        
         # Remove bold  **text**
         text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
         # Remove italic *text*
@@ -354,17 +299,7 @@ class JDParser:
 
     @staticmethod
     def _split_sections(text: str) -> dict[str, str]:
-        """
-        Split cleaned JD text into named sections.
-
-        Scans line-by-line, activating a section when a header matches.
-        An unrecognised heading resets the active section to None (stops
-        collecting) so that location/logistics content is excluded.
-
-        Returns dict keys: "required", "nice_to_have", "disqualifiers".
-        Values are the concatenated content lines under each header.
-        Empty string if the header was not found.
-        """
+        
         buckets: dict[str, list[str]] = {
             "required": [],
             "nice_to_have": [],
@@ -402,19 +337,7 @@ class JDParser:
 
     @staticmethod
     def _build_vocabulary(skill_map_path: Path) -> list[str]:
-        """
-        Build the skill scanning vocabulary from skill_map.json.
-
-        Sources (in order of inclusion):
-          1. All keys in synonyms, co_skills, domain_transfers sections.
-          2. All synonym *values* — so "torch" is recognised as well as "pytorch".
-          3. _DISQUALIFIER_DOMAINS — always included even if not in skill_map.
-          4. _FALLBACK_REQUIRED — always included as a safety net.
-
-        Terms shorter than 2 characters are excluded (noise reduction).
-        The list is sorted longest-first so that "sentence transformers" is
-        tested before "transformers", preventing premature partial matches.
-        """
+       
         vocab: set[str] = set()
 
         if skill_map_path.exists():
@@ -447,18 +370,7 @@ class JDParser:
     # ------------------------------------------------------------------ #
 
     def _scan_for_skills(self, text: str) -> list[str]:
-        """
-        Find all vocabulary skills mentioned in the given text.
-
-        Scans both the original text and a hyphen-normalised version so
-        "sentence-transformers" (with hyphen) matches "sentence transformers"
-        (vocabulary entry with space).
-
-        Non-word boundaries are used: "map" must not match inside "mapping";
-        "python" must not match inside "cpython" or "python3".
-
-        Returns deduplicated list in match order (first occurrence).
-        """
+        
         if not text.strip():
             return []
 
@@ -482,10 +394,7 @@ class JDParser:
         return found
 
     def _spacy_supplement(self, text: str) -> list[str]:
-        """
-        Return noun-phrase candidates from spaCy that are also in vocabulary.
-        Called only when _SPACY_AVAILABLE is True and skill count is low.
-        """
+        
         if not _SPACY_AVAILABLE or _nlp is None:
             return []
         doc = _nlp(text[:4000])  # respect spaCy's practical context limit
@@ -504,16 +413,7 @@ class JDParser:
     def _extract_required(
         self, sections: dict[str, str], full_text: str
     ) -> list[str]:
-        """
-        Extract required skills.
-
-        Strategy:
-          1. Scan the detected 'required' section.
-          2. If section empty, scan the "absolutely need" paragraph in full_text.
-          3. Optionally supplement with spaCy when vocabulary scan is thin.
-          4. Remove disqualifier-domain skills from the required list.
-          5. Safety net: pad with _FALLBACK_REQUIRED if count < _MIN_REQUIRED_SKILLS.
-        """
+        
         section_text = sections.get("required", "")
 
         # Regex supplement: capture "absolutely need" paragraph from full text
@@ -565,7 +465,6 @@ class JDParser:
     def _extract_nth(
         self, sections: dict[str, str], full_text: str
     ) -> list[str]:
-        """Extract preferred-but-not-required skills."""
         section_text = sections.get("nice_to_have", "")
 
         nth_match = re.search(
@@ -586,16 +485,7 @@ class JDParser:
     # ------------------------------------------------------------------ #
 
     def _extract_disqualifiers(self, sections: dict[str, str]) -> list[str]:
-        """
-        Return wrong-domain skill names found in the disqualifiers section.
-
-        These are used by scoring/skill_match.py to penalise candidates
-        whose profile is *dominated* by these domains (e.g. a pure CV
-        engineer applying for an IR role).
-
-        Note: disqualify_consulting_only and disqualify_no_production are
-        stored as boolean flags, not in this list.
-        """
+        
         disq_text = sections.get("disqualifiers", "")
         found: list[str] = []
         seen: set[str] = set()
@@ -618,18 +508,7 @@ class JDParser:
     def _extract_yoe(
         self, text: str
     ) -> tuple[float, float, float, float]:
-        """
-        Extract years-of-experience bounds from "N-M years" patterns.
-
-        Logic:
-          - Find all "N-M years" matches in text (handles en-dash, hyphen, "to").
-          - Narrowest valid range = ideal band  (e.g. -–9 → ideal_min=5, ideal_max=9).
-          - Soft outer bounds = ideal_min - 1 and ideal_max + 3.
-          - Falls back to config constants when no match found.
-
-        Returns:
-            (yoe_min, yoe_max, yoe_ideal_min, yoe_ideal_max)
-        """
+        
         raw_matches = _YOE_RE.findall(text)
         valid_ranges: list[tuple[float, float]] = []
 
@@ -669,12 +548,7 @@ class JDParser:
 
     @staticmethod
     def _extract_locations(text: str) -> list[str]:
-        """
-        Return preferred Indian city names found in the JD text.
-
-        _KNOWN_CITIES is pre-sorted longest-first so "delhi ncr" is matched
-        before "delhi".
-        """
+        
         text_lower = text.lower()
         found: list[str] = []
         seen: set[str] = set()
@@ -693,7 +567,7 @@ class JDParser:
 
     @staticmethod
     def _detect_relocation(text: str) -> bool:
-        """Return True if JD mentions relocation acceptance."""
+
         return bool(re.search(
             r"relocation|willing\s+to\s+relocate|open\s+to\s+relocation",
             text, re.IGNORECASE,
@@ -703,18 +577,7 @@ class JDParser:
     def _detect_consulting_disqualifier(
         sections: dict[str, str], full_text: str
     ) -> bool:
-        """
-        Return True if the JD explicitly disqualifies consulting-only backgrounds.
-
-        Two-pass detection:
-          Pass 1: Consulting firm names present in disqualifiers section AND
-                  context uses disqualifying language ("only … TCS/Wipro …",
-                  "won't move forward", etc.).
-          Pass 2: Full-text fallback for "only worked at consulting firms" pattern.
-
-        Avoids false positives from lines like "If you're currently at one of
-        these companies but have prior product-company experience, that's fine."
-        """
+        
         disq_text = sections.get("disqualifiers", "")
 
         # Pass 1: disqualifiers section
@@ -765,19 +628,7 @@ class JDParser:
         required_skills: list[str],
         full_text: str,
     ) -> str:
-        """
-        Build a semantically focused encoding text for the MiniLM bi-encoder.
-
-        The bi-encoder query vector is compared against candidate profile
-        vectors in FAISS. Using the full JD text would dilute the semantic
-        signal with boilerplate. Instead we compose:
-
-          "<role tag>. <required skills>. <required section snippet>. <role description snippet>"
-
-        Capped at 900 characters (~680 tokens) — within MiniLM's 512-token
-        max (mean-pooling truncation would handle overflow anyway, but keeping
-        below the limit improves embedding quality).
-        """
+        
         role_tag = "Senior AI Engineer role. Required skills: "
         skills_str = ", ".join(required_skills[:15]) + "."
 
@@ -804,16 +655,7 @@ class JDParser:
     # ------------------------------------------------------------------ #
 
     def _get_encoder(self):
-        """
-        Lazy-load and cache the sentence-transformer bi-encoder.
-
-        The model is loaded with device="cpu" to enforce CPU-only execution
-        regardless of the runtime environment (spec requirement).
-
-        Raises:
-            RuntimeError: sentence_transformers not installed, or model
-                          not cached (needs internet on first run).
-        """
+       
         if self._encoder is None:
             try:
                 from sentence_transformers import SentenceTransformer  # noqa: PLC0415
@@ -839,18 +681,7 @@ class JDParser:
         return self._encoder
 
     def _encode(self, encoding_text: str) -> list[float]:
-        """
-        Encode the focused JD text to a normalised 384-dim vector.
-
-        normalize_embeddings=True ensures cosine similarity is equivalent
-        to dot-product, which is required for FAISS IndexFlatIP queries.
-
-        Returns:
-            list[float] of length config.EMBEDDING_DIM (384).
-
-        Raises:
-            AssertionError: Embedding dimension mismatch (wrong model cached).
-        """
+       
         encoder = self._get_encoder()
         vector = encoder.encode(
             encoding_text,
@@ -888,21 +719,6 @@ def parse_jd(
     skill_map_path: Optional[Path] = None,
     encode: bool = True,
 ) -> JDIntent:
-    """
-    One-shot convenience wrapper around JDParser.
-
-    Creates a new JDParser on each call (re-loads skill_map, rebuilds vocab).
-    For repeated calls — e.g. Streamlit reruns or tests — instantiate
-    JDParser once and call .parse() directly to reuse the cached vocabulary
-    and lazy-loaded encoder.
-
-    Args:
-        jd_source:      Raw JD text (str) or Path to .md / .txt file.
-        skill_map_path: Override path for skill_map.json (for testing).
-        encode:         Whether to compute the bi-encoder embedding.
-
-    Returns:
-        Fully-populated JDIntent.
-    """
+    
     return JDParser(skill_map_path=skill_map_path).parse(jd_source, encode=encode)
 

@@ -8,28 +8,11 @@ logger = logging.getLogger(__name__)
 
 
 class HoneypotCleanup:
-    """
-    Remove flagged honeypot candidates from the post-RRF pool.
-
-    Usage in runner.py:
-        cleanup = HoneypotCleanup()
-        clean_pool = cleanup.cleanup_candidates(rrf_pool)
-    """
 
     def cleanup_candidates(
         self,
         candidates: list[CandidateFeatureVector],
     ) -> list[CandidateFeatureVector]:
-        """
-        Filter out candidates with is_honeypot=True.
-
-        Args:
-            candidates: List of CandidateFeatureVector objects (post-RRF pool).
-
-        Returns:
-            New list containing only clean (non-honeypot) candidates,
-            in the same relative order as the input.
-        """
         honeypots = [c for c in candidates if c.is_honeypot]
         clean = [c for c in candidates if not c.is_honeypot]
 

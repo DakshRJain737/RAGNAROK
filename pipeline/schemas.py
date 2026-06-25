@@ -35,13 +35,7 @@ _CANDIDATE_ID_RE = re.compile(config.SUBMISSION_CANDIDATE_ID_PATTERN)
 
 @dataclass
 class SkillRecord:
-    """
-    Normalised skill entry from a candidate's skills[] array.
-
-    Constructed by pipeline/candidate_parser.py from raw JSON.
-    Consumed by scoring/skill_match.py and ontology/graph_traversal.py.
-    """
-
+    
     name: str                       # Lowercase-normalised skill name
     name_raw: str                   # Original casing from profile
     proficiency: str                # "beginner" | "intermediate" | "advanced" | "expert"
@@ -67,13 +61,6 @@ class SkillRecord:
 
 @dataclass
 class CareerEntry:
-    """
-    Single job in a candidate's career_history[] array.
-
-    Constructed by pipeline/candidate_parser.py.
-    Consumed by scoring/career_quality.py, indexing/trajectory_builder.py,
-    and indexing/honeypot_registry.py.
-    """
 
     company: str                    # Company name (original casing)
     company_lower: str              # Lowercase for consulting-firm lookup
@@ -94,13 +81,7 @@ class CareerEntry:
 
 @dataclass
 class EducationEntry:
-    """
-    Single education record from a candidate's education[] array.
-
-    Used by indexing/honeypot_registry.py (overlapping date detection)
-    and scoring/career_quality.py (institution tier).
-    """
-
+    
     institution: str
     degree: str
     field_of_study: str
@@ -116,17 +97,6 @@ class EducationEntry:
 
 @dataclass
 class RedrobSignals:
-    """
-    All 23 behavioral signals from the redrob_signals object.
-
-    Constructed by pipeline/candidate_parser.py from raw JSON.
-    Consumed by scoring/behavioral.py, indexing/feature_store.py,
-    and retrieval/signal_path.py.
-
-    Special values:
-      github_activity_score = -1.0  →  no GitHub linked
-      offer_acceptance_rate = -1.0  →  no offer history
-    """
 
     profile_completeness_score: float   # 0–100
     signup_date: date
@@ -155,19 +125,16 @@ class RedrobSignals:
 
     @property
     def days_since_active(self) -> int:
-        """Days elapsed since last_active_date. Used for recency decay."""
         today = date.today()
         delta = today - self.last_active_date
         return max(0, delta.days)
 
     @property
     def has_github(self) -> bool:
-        """True if GitHub is linked (score != -1)."""
         return self.github_activity_score >= 0.0
 
     @property
     def has_offer_history(self) -> bool:
-        """True if candidate has prior offer history (rate != -1)."""
         return self.offer_acceptance_rate >= 0.0
 
 
@@ -177,17 +144,6 @@ class RedrobSignals:
 
 @dataclass
 class CandidateFeatureVector:
-    """
-    Fully parsed and normalised representation of one candidate.
-
-    This is the central data contract. Built by pipeline/candidate_parser.py.
-    All downstream components (indexers, scorers, retrievers) consume this.
-
-    Dev A: retrieval paths and trust layer read from this.
-    Dev B: indexers and scorers write against this interface.
-
-    NEVER add raw JSON fields here. All fields must be normalised.
-    """
 
     # ── Identity ──────────────────────────────────────────────────────────────
     candidate_id: str               # "CAND_XXXXXXX" — validated on construction
@@ -240,11 +196,9 @@ class CandidateFeatureVector:
             )
 
     def has_skill(self, skill_name_lower: str) -> bool:
-        """O(1) check for skill membership (normalised lowercase)."""
         return skill_name_lower in self.skill_names_lower
 
     def get_skill(self, skill_name_lower: str) -> Optional[SkillRecord]:
-        """Return SkillRecord for a skill name, or None if not present."""
         for s in self.skills:
             if s.name == skill_name_lower:
                 return s
@@ -257,15 +211,7 @@ class CandidateFeatureVector:
 
 @dataclass
 class RetrievalResult:
-    """
-    One candidate retrieved by a single retrieval path.
-
-    Produced by retrieval/semantic_path.py, keyword_path.py,
-    ontology_path.py, trajectory_path.py, signal_path.py.
-
-    Consumed by retrieval/rrf_fusion.py.
-    """
-
+    
     candidate_id: str
     path_score: float       # Raw score from this path (not normalised)
     path_name: str          # "semantic" | "keyword" | "ontology" | "trajectory" | "signal"
@@ -278,12 +224,6 @@ class RetrievalResult:
 
 @dataclass
 class RRFResult:
-    """
-    Candidate after Reciprocal Rank Fusion across all 5 paths.
-
-    Produced by retrieval/rrf_fusion.py.
-    Consumed by scoring/honeypot_filter.py → scoring/cross_encoder.py.
-    """
 
     candidate_id: str
     rrf_score: float            # Σ 1/(k + rank) across all paths (with bonuses)
@@ -297,15 +237,7 @@ class RRFResult:
 
 @dataclass
 class ComponentScores:
-    """
-    Decomposed scoring breakdown for one candidate.
-
-    Produced by scoring/skill_match.py, career_quality.py, behavioral.py.
-    Consumed by scoring/composite.py and trust/advocate.py + trust/skeptic.py.
-
-    All component scores are in [0.0, 1.0] before composite fusion.
-    """
-
+    
     candidate_id: str
 
     # ── Primary components ────────────────────────────────────────────────────
@@ -336,7 +268,7 @@ class ComponentScores:
 
 @dataclass
 class AdvocateSignal:
-    """One piece of positive evidence from the Advocate agent."""
+    
     label: str              # Human-readable signal description
     confidence: str         # "HIGH" | "MEDIUM" | "LOW"
     value: str              # Specific value or fact from profile
@@ -344,7 +276,6 @@ class AdvocateSignal:
 
 @dataclass
 class SkepticSignal:
-    """One risk flag from the Skeptic agent."""
     label: str              # Human-readable risk description
     severity: str           # "HIGH" | "MODERATE" | "LOW"
     value: str              # Specific value or fact causing the concern
@@ -352,13 +283,7 @@ class SkepticSignal:
 
 @dataclass
 class TrustVerdict:
-    """
-    Full adversarial trust analysis for one candidate.
-
-    Produced by trust/verdict.py (combining advocate.py + skeptic.py).
-    Consumed by trust/reasoning_generator.py and ui/components/candidate_card.py.
-    """
-
+   
     candidate_id: str
     advocate_signals: list[AdvocateSignal]
     skeptic_signals: list[SkepticSignal]
@@ -378,18 +303,7 @@ class TrustVerdict:
 
 @dataclass
 class RankedCandidate:
-    """
-    Final ranked output for one candidate. Directly maps to one CSV row.
-
-    Produced by pipeline/runner.py after all stages complete.
-    Written to submission CSV by rank.py.
-
-    candidate_id  → CSV column: candidate_id
-    rank          → CSV column: rank  (1–100)
-    final_score   → CSV column: score (non-increasing)
-    reasoning     → CSV column: reasoning (1–2 sentences)
-    """
-
+   
     candidate_id: str
     rank: int                   # 1–100, assigned after final sort
     final_score: float          # 0.0–1.0, composite score
@@ -414,7 +328,6 @@ class RankedCandidate:
             )
 
     def to_csv_row(self) -> dict[str, str]:
-        """Return a dict matching the submission CSV header order."""
         return {
             "candidate_id": self.candidate_id,
             "rank": str(self.rank),
@@ -429,14 +342,7 @@ class RankedCandidate:
 
 @dataclass
 class JDIntent:
-    """
-    Structured intent extracted from the job description.
-
-    Produced by pipeline/jd_parser.py.
-    Consumed by all retrieval paths, scoring/skill_match.py,
-    scoring/career_quality.py, and ontology/query_expander.py.
-    """
-
+    
     # ── Skill tiers ───────────────────────────────────────────────────────────
     required_skills: list[str]          # Must-have skills (lowercase normalised)
     nice_to_have_skills: list[str]      # Preferred but not required (lowercase)
@@ -470,18 +376,10 @@ class JDIntent:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def validate_candidate_id(candidate_id: str) -> bool:
-    """Return True if candidate_id matches CAND_XXXXXXX pattern."""
     return bool(_CANDIDATE_ID_RE.match(candidate_id))
 
 
 def validate_ranked_list(ranked: list[RankedCandidate]) -> list[str]:
-    """
-    Validate a list of RankedCandidate objects against submission rules.
-
-    Returns a list of error strings (empty = valid).
-    Mirrors the logic in validate_submission.py so we can catch errors
-    before writing the CSV.
-    """
     errors: list[str] = []
 
     if len(ranked) != config.SUBMISSION_EXPECTED_ROWS:

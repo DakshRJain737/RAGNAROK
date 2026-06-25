@@ -72,7 +72,6 @@ def _expand_query(tokens: list[str]) -> list[str]:
 # ── BM25 core ─────────────────────────────────────────────────────────────────
 
 class _BM25Core:
-    """Pure Okapi BM25 over a pre-tokenized corpus."""
 
     def __init__(self, corpus: list[list[str]], k1: float = 1.5, b: float = 0.75) -> None:
         self.k1 = k1
@@ -143,15 +142,7 @@ class _BM25Core:
 # ── Public class ──────────────────────────────────────────────────────────────
 
 class BM25Index:
-    """
-    Keyword retrieval index over CandidateFeatureVector.
-
-    API mirrors FaissIndex:
-        .build(candidates, save=True)
-        .load()
-        .search(query_text, top_k) → list[tuple[str, float]]
-    """
-
+    
     def __init__(self, index_path: Path = config.BM25_INDEX_PATH) -> None:
         self.index_path = index_path
         self._core: Optional[_BM25Core] = None
@@ -203,12 +194,7 @@ class BM25Index:
         top_k: int = config.KEYWORD_PATH_TOP_K,
         expand: bool = True,
     ) -> list[tuple[str, float]]:
-        """
-        Keyword search with optional ontology expansion.
-
-        Returns:
-            list of (candidate_id, bm25_score) sorted descending
-        """
+        
         self._require_loaded()
 
         tokens = _tokenize(query_text)

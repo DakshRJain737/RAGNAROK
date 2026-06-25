@@ -21,18 +21,7 @@ _WORK_MODE_MAP = {"onsite": 0.0, "hybrid": 0.5, "remote": 1.0}
 
 
 class FeatureStore:
-    """
-    Pre-scores every candidate into a fixed 30-dim float32 vector.
-
-    Usage:
-        fs = FeatureStore()
-        matrix = fs.build(candidates, save=True)   # → [N × 30]
-
-        fs = FeatureStore()
-        fs.load()
-        vec = fs.get(candidate_id)                 # → np.ndarray [30]
-    """
-
+    
     def __init__(
         self,
         feature_path: Path = config.FEATURE_STORE_PATH,
@@ -51,18 +40,7 @@ class FeatureStore:
         save: bool = True,
         today: Optional[date] = None,
     ) -> np.ndarray:
-        """
-        Encode all candidates into the feature matrix.
-
-        Args:
-            candidates: parsed CandidateFeatureVector list (honeypot flags must
-                        already be set — run HoneypotFilter.run_honeypot_filters first)
-            save:       persist matrix + id list to disk
-            today:      override 'today' for testing (default: date.today())
-
-        Returns:
-            np.ndarray of shape [N × 30], dtype float32, all values in [0, 1]
-        """
+        
         if not candidates:
             raise ValueError("candidates list is empty.")
 
@@ -95,7 +73,6 @@ class FeatureStore:
         return matrix
 
     def load(self) -> None:
-        """Load pre-built matrix and id map from disk."""
         if not self.feature_path.exists():
             raise FileNotFoundError(
                 f"Feature store not found at '{self.feature_path}'. Run .build() first."
@@ -106,7 +83,6 @@ class FeatureStore:
         logger.info("FeatureStore loaded: shape=%s", self._matrix.shape)
 
     def get(self, candidate_id: str) -> np.ndarray:
-        """Return the 30-dim feature vector for a single candidate."""
         self._require_loaded()
         idx = self._id_to_idx.get(candidate_id)
         if idx is None:
@@ -114,7 +90,6 @@ class FeatureStore:
         return self._matrix[idx]
 
     def get_batch(self, candidate_ids: list[str]) -> np.ndarray:
-        """Return [K × 30] matrix for an ordered list of candidate_ids."""
         self._require_loaded()
         # Single dict lookup per id + one numpy fancy-index — avoids K individual get() calls
         # each of which re-ran _require_loaded() and a redundant is_loaded check
@@ -130,10 +105,7 @@ class FeatureStore:
 
     @staticmethod
     def _to_vector(c: CandidateFeatureVector, today: date, trajectory_analyzer: TrajectoryAnalyzer) -> np.ndarray:
-        """
-        Map one CandidateFeatureVector → float32 ndarray of shape [30].
-        Every dimension is independently clipped to [0, 1].
-        """
+        
         s = c.signals
         traj = trajectory_analyzer.build_feature_vector(c)
 

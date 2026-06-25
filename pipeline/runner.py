@@ -4,7 +4,6 @@ import logging
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
 
 import config
 from pipeline.schemas import (
@@ -18,17 +17,6 @@ logger = logging.getLogger(__name__)
 
 
 class PipelineRunner:
-    """
-    Orchestrates the full ranking pipeline.
-
-    Args:
-        jd:         Parsed JDIntent (from pipeline/jd_parser.py).
-        candidates: List of CandidateFeatureVector (from pipeline/candidate_parser.py).
-
-    Usage:
-        runner = PipelineRunner(jd=intent, candidates=candidates)
-        ranked, timings = runner.run(top_k=100)
-    """
 
     def __init__(
         self,
@@ -45,9 +33,7 @@ class PipelineRunner:
         self,
         top_k: int = 100,
     ) -> tuple[list[RankedCandidate], dict[str, float]]:
-        """
-        Run the full pipeline. Returns (ranked_candidates, stage_timings_ms).
-        """
+        
         timings: dict[str, float] = {}
         total_start = time.perf_counter()
 
