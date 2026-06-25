@@ -198,7 +198,7 @@ def _pool_infer(task: tuple) -> tuple[str, str]:
     try:
         out = _worker_llm.create_chat_completion(
             messages=messages,
-            temperature=0.4,
+            temperature=0.3,
             max_tokens=80,
             stop=["\n\n", "Sentence 3", "3.", "\nJob:"],
         )
