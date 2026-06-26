@@ -12,14 +12,7 @@ from pipeline.schemas import CandidateFeatureVector, JDIntent, SkillRecord
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────
 # CAPABILITY TREE
-# Each cluster has a weight (must sum to 1.0 across clusters).
-# Each capability inside a cluster has a weight (must sum to 1.0
-# within the cluster).  Skills are lowercase — matched against
-# candidate skill.name (already lowercased in CandidateFeatureVector).
-# ─────────────────────────────────────────────────────────────
-
 _CAPABILITY_TREE: dict = {
 
     "retrieval_systems": {
@@ -180,9 +173,7 @@ for _cname, _cluster in _CAPABILITY_TREE.items():
     ) < 1e-6, f"Capability weights in '{_cname}' must sum to 1.0"
 
 
-# ─────────────────────────────────────────────────────────────
 # PROFICIENCY / TRUST / BOOST
-# ─────────────────────────────────────────────────────────────
 
 _PROF_REQUIRED: dict[str, float] = dict(config.PROFICIENCY_MULTIPLIERS)
 _PROF_NICE: dict[str, float]     = {k: v * 0.70 for k, v in config.PROFICIENCY_MULTIPLIERS.items()}
@@ -199,12 +190,8 @@ _ASSESSMENT_WEIGHT: float    = config.ASSESSMENT_SCORE_WEIGHT
 
 _DISQUALIFIER_HARD_PENALTY: float = getattr(config, "DISQUALIFIER_HARD_PENALTY", 0.25)
 _DISQUALIFIER_SOFT_PENALTY: float = getattr(config, "DISQUALIFIER_SOFT_PENALTY", 0.70)
-# Hard disq only fires for expert/advanced: intermediate is incidental exposure,
-# not a primary domain indicator. Previously included "intermediate" which was
-# too aggressive (zeroed candidates with only a passing familiarity with CV/speech).
 _DISQUALIFIER_HARD_PROFICIENCY: frozenset[str] = frozenset(("expert", "advanced"))
 
-# Normalised final-score weights (keep ratio 2:1 from config, but normalise to [0,1])
 _REQ_W: float  = config.REQUIRED_SKILL_WEIGHT / (
     config.REQUIRED_SKILL_WEIGHT + config.NICE_TO_HAVE_SKILL_WEIGHT
 )
@@ -212,10 +199,6 @@ _NICE_W: float = config.NICE_TO_HAVE_SKILL_WEIGHT / (
     config.REQUIRED_SKILL_WEIGHT + config.NICE_TO_HAVE_SKILL_WEIGHT
 )
 
-
-# ─────────────────────────────────────────────────────────────
-# DATACLASSES
-# ─────────────────────────────────────────────────────────────
 
 @dataclass(slots=True)
 class ClusterScore:
@@ -238,10 +221,6 @@ class SkillMatchResult:
     soft_disqualifier:     bool
     cluster_scores:        list[ClusterScore]
 
-
-# ─────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────
 
 def _duration_trust(duration_months: int) -> float:
     if duration_months <= 0:
@@ -272,11 +251,6 @@ def _effective_proficiency(skill: SkillRecord, prof_multiplier: float) -> float:
 def _build_lookup(
     skills: list[SkillRecord],
 ) -> tuple[dict[str, SkillRecord], dict[str, SkillRecord]]:
-    """
-    Build direct and synonym lookup maps from candidate's skill list.
-    Direct map: canonical skill name → SkillRecord (full credit).
-    Synonym map: ontology synonym → SkillRecord (partial credit via ONTOLOGY_PARTIAL_CREDIT).
-    """
     direct_map:  dict[str, SkillRecord] = {}
     synonym_map: dict[str, SkillRecord] = {}
 
@@ -297,12 +271,6 @@ def _score_skill_against_lookup(
     prof_table: dict[str, float],
     endorse_factor: float = 1.0,
 ) -> tuple[float, str | None]:
-    """
-    Score a single required/nice-to-have skill name against the candidate lookup.
-
-    Returns (score, matched_skill_name_raw) where score is the proficiency ×
-    trust + endorsement value, and matched_skill_name_raw is None if no match.
-    """
     if skill_name in direct_map:
         skill_rec = direct_map[skill_name]
         credit = 1.0
@@ -325,17 +293,6 @@ def _score_skill_against_lookup(
 # ─────────────────────────────────────────────────────────────
 
 class SkillMatchScorer:
-    """
-    Hierarchical capability-cluster scorer.
-
-    The tree is: clusters → capabilities → skill sets.
-    Each capability score = best single-skill match within that capability
-    (a candidate who knows FAISS gets full vector_db capability credit —
-    they don't need to list Pinecone AND Weaviate AND Qdrant too).
-    Capability scores are weighted within their cluster; cluster scores
-    are weighted across clusters to produce required_score.
-    """
-
     def __init__(self) -> None:
         # Pre-expand ontology for every skill set at construction time.
         self._expanded_tree: dict = {}
@@ -350,8 +307,6 @@ class SkillMatchScorer:
                 "weight": cluster["weight"],
                 "capabilities": capability_map,
             }
-
-    # ── Public API ────────────────────────────────────────────
 
     def score(
         self,
@@ -397,10 +352,6 @@ class SkillMatchScorer:
         candidates: list[CandidateFeatureVector],
         jd: JDIntent,
     ) -> dict[str, SkillMatchResult]:
-        """
-        Score all candidates. Returns dict[candidate_id → SkillMatchResult]
-        for O(1) lookup in CompositeScorer.rank().
-        """
         t0 = time.perf_counter()
         results = {c.candidate_id: self.score(c, jd) for c in candidates}
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -416,25 +367,12 @@ class SkillMatchScorer:
         )
         return results
 
-    # ── Cluster / capability scoring ──────────────────────────
-
     def _score_capability(
         self,
         expanded_skills: set[str],
         direct_map: dict[str, SkillRecord],
         synonym_map: dict[str, SkillRecord],
     ) -> tuple[float, list[str]]:
-        """
-        Score one capability (e.g. "vector_db").
-
-        Strategy: take the BEST single matching skill within this capability.
-        Rationale: a candidate who knows FAISS has the vector-db capability —
-        they don't need to also know Pinecone to prove it. We reward breadth
-        at the cluster level (multiple capabilities covered), not within a
-        capability.
-
-        Returns (score in [0,1], list of matched skill name_raws).
-        """
         best_score: float         = 0.0
         matched:    list[str]     = []
 
@@ -462,10 +400,6 @@ class SkillMatchScorer:
         direct_map: dict[str, SkillRecord],
         synonym_map: dict[str, SkillRecord],
     ) -> tuple[list[ClusterScore], float]:
-        """
-        Score all clusters and return (cluster_score_list, overall_required_score).
-        overall_required_score is the weighted sum of cluster scores, in [0, 1].
-        """
         cluster_scores: list[ClusterScore] = []
         total_score = 0.0
 
@@ -563,7 +497,6 @@ class SkillMatchScorer:
     # ── Ontology expansion ────────────────────────────────────
 
     def _expand_skills(self, skills: list[str]) -> set[str]:
-        """DFS expansion through ONTOLOGY graph. Returns a flat set of all aliases."""
         expanded: set[str] = set()
         stack = [s.lower().strip() for s in skills if s.strip()]
         while stack:
@@ -583,10 +516,6 @@ class SkillMatchScorer:
     def __repr__(self) -> str:
         return f"SkillMatchScorer({len(self._expanded_tree)} clusters)"
 
-
-# ─────────────────────────────────────────────────────────────
-# MODULE SINGLETON
-# ─────────────────────────────────────────────────────────────
 
 _SCORER = SkillMatchScorer()
 

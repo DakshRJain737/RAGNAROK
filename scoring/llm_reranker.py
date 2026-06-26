@@ -56,10 +56,6 @@ Facts:
 Brief:"""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pure helpers (picklable — called in worker processes)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _smart_truncate(value: str, max_len: int) -> str:
     if len(value) <= max_len:
         return value
@@ -136,19 +132,6 @@ def _build_messages(
         {"role": "user", "content": prompt},
     ]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Process-pool worker
-#
-# Each worker process holds its own Llama instance in a module-level global.
-# This means:
-#   • No lock needed — one model per process, calls are already serial per worker.
-#   • True parallelism — N workers run N inferences simultaneously on N CPU cores.
-#   • Memory cost — each worker loads the full model (~1–4 GB depending on quant).
-#     Use num_workers=2 if RAM is tight; 4 if you have ≥16 GB free.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Module-level: one per worker process, never shared across processes.
 _worker_llm = None
 _worker_logger = None
 
@@ -159,13 +142,6 @@ def _pool_initializer(
     n_threads: int,
     verbose: bool,
 ) -> None:
-    """
-    Called once when each worker process starts.
-    Loads the GGUF model into _worker_llm for this process only.
-    n_threads here refers to threads *within* one llama_cpp instance —
-    keep this low (1–2) when running multiple workers so cores aren't
-    over-subscribed.
-    """
     global _worker_llm, _worker_logger
     _worker_logger = logging.getLogger(__name__)
 
@@ -184,11 +160,6 @@ def _pool_initializer(
 
 
 def _pool_infer(task: tuple) -> tuple[str, str]:
-    """
-    Called per candidate in a worker process.
-    task = (candidate_id, messages, fallback)
-    Returns (candidate_id, justification_text).
-    """
     cid, messages, fallback = task
 
     if _worker_llm is None:
@@ -219,28 +190,8 @@ def _pool_infer(task: tuple) -> tuple[str, str]:
         return cid, fallback
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Main class
-# ─────────────────────────────────────────────────────────────────────────────
-
 class LLMReranker:
-    """
-    Local GGUF LLM used exclusively for post-ranking justification.
-
-    Uses a multiprocessing Pool so each worker process holds its own Llama
-    instance. This gives true CPU parallelism — N workers run N inferences
-    simultaneously — unlike threads which are serialised by llama_cpp's
-    internal locking and Python's GIL.
-
-    Memory note:
-        Each worker loads the full model file. A Q4_K_M 7B model ≈ 4 GB.
-        With num_workers=4 that's ~16 GB RAM. Use num_workers=2 if tight.
-
-    n_threads_per_worker:
-        Threads inside each llama_cpp instance. Keep at 1–2 when running
-        multiple workers — the total thread count is num_workers × this,
-        and over-subscribing cores hurts throughput. Default 2.
-    """
 
     @staticmethod
     def download_model(repo_id: str, filename: str, local_dir: str) -> None:
@@ -261,9 +212,6 @@ class LLMReranker:
         self._n_ctx = n_ctx
         self._verbose = verbose
         self._num_workers = max_workers
-        # Each worker uses n_threads_per_worker internal threads.
-        # If not explicitly set, derive from n_threads for back-compat:
-        # spread n_threads evenly across workers, minimum 1.
         self._n_threads_per_worker = n_threads_per_worker or max(1, n_threads // max_workers)
 
         self._pool: Optional[mp.pool.Pool] = None
@@ -272,13 +220,6 @@ class LLMReranker:
     # ── Pool lifecycle ────────────────────────────────────────────────────
 
     def preload(self) -> None:
-        """
-        Start worker processes and load the model in each one.
-
-        Call at pipeline startup. Workers stay alive between calls to
-        justify_candidates so the model never needs to reload mid-pipeline.
-        Call shutdown() during teardown, or use as a context manager.
-        """
         if self._pool is not None:
             return
 
@@ -300,8 +241,6 @@ class LLMReranker:
             ),
         )
 
-        # Warm all workers with a trivial ping so startup is paid at preload
-        # time, not during the first real batch.
         dummy = [("__warmup__", [], "__warmup__")] * self._num_workers
         self._pool.map(_pool_infer, dummy)
 
@@ -312,7 +251,6 @@ class LLMReranker:
         )
 
     def shutdown(self) -> None:
-        """Terminate worker processes. Safe to call multiple times."""
         if self._pool is not None:
             self._pool.terminate()
             self._pool.join()
@@ -358,11 +296,6 @@ class LLMReranker:
         results: dict[str, str] = {}
         t0 = time.perf_counter()
 
-        # ── Build task list ───────────────────────────────────────────────
-        # Tasks sent to workers are plain tuples of picklable primitives.
-        # Pydantic/dataclass objects (CandidateFeatureVector, TrustVerdict)
-        # are consumed here in the main process to build the message dicts,
-        # which are plain Python dicts — cheaply picklable across the pipe.
         tasks: list[tuple[str, list[dict], str]] = []
 
         for i, cfv in enumerate(candidates, start=1):
@@ -403,12 +336,6 @@ class LLMReranker:
         if not tasks:
             return results
 
-        # ── Dispatch to process pool ──────────────────────────────────────
-        # imap_unordered streams results back as soon as any worker finishes,
-        # so we can log progress without waiting for the whole batch.
-        # One chunk per worker minimises IPC round-trips for small batches
-        # (50 tasks / 4 workers = ~13 tasks/chunk, far better than the old
-        # ceil(tasks / workers*4) which produced chunks of 3–4).
         chunksize = max(1, math.ceil(len(tasks) / self._num_workers))
 
         completed = 0

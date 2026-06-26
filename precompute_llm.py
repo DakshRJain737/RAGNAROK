@@ -8,11 +8,6 @@ logger = logging.getLogger(__name__)
 
 
 def download_llm_model() -> None:
-    """
-    Download the GGUF model if not already present.
-    Skips silently if model file already exists at config.LLM_MODEL_PATH.
-    Requires network access — only called from precompute.py.
-    """
     model_path = Path(config.LLM_MODEL_PATH)
 
     if model_path.exists():
@@ -34,13 +29,6 @@ def download_llm_model() -> None:
     )
     logger.info("LLM model ready at %s (%.0f MB)", model_path, model_path.stat().st_size / 1e6)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Add this line at the bottom of your precompute.py main() function:
-#
-#   download_llm_model()
-#
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

@@ -12,14 +12,6 @@ from pipeline.schemas import CandidateFeatureVector, RedrobSignals
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Signal-presence checks — drive the uncertainty penalty
-# ─────────────────────────────────────────────────────────────────────────────
-# Each predicate answers "does this candidate actually have data for this
-# signal type, or is it sitting at its empty/unknown default?". The count of
-# True predicates is `signal_count`. A candidate with a thin profile (few
-# True values) gets a lower `uncertainty_penalty`, which composite.py
-# multiplies into the final score to avoid over-trusting sparse profiles.
 _SIGNAL_PRESENCE_CHECKS: dict[str, Callable[[RedrobSignals], bool]] = {
     "profile_views_30d":      lambda s: s.profile_views_received_30d > 0,
     "applications_30d":       lambda s: s.applications_submitted_30d > 0,
@@ -35,7 +27,6 @@ _SIGNAL_PRESENCE_CHECKS: dict[str, Callable[[RedrobSignals], bool]] = {
 
 @dataclass(frozen=True)
 class BehavioralResult:
-    """Output of BehavioralScorer.score() for one candidate."""
 
     candidate_id: str
 
@@ -51,12 +42,6 @@ class BehavioralResult:
 
 
 class BehavioralScorer:
-    """
-    Stateless scorer for the behavioral component of the composite score.
-
-    score() reads only `candidate.signals` (RedrobSignals); none of the
-    skill/career fields on CandidateFeatureVector are touched.
-    """
 
     def score(
         self,
@@ -115,13 +100,11 @@ class BehavioralScorer:
 
     @staticmethod
     def _recency_score(s: RedrobSignals, today: date) -> float:
-        """Exponential recency decay: e^(-λ · days_since_active)."""
         days_inactive = (today - s.last_active_date).days
         return math.exp(-config.RECENCY_LAMBDA * max(days_inactive, 0))
 
     @staticmethod
     def _notice_period_score(notice_period_days: int) -> float:
-        """Tiered linear decay via config NOTICE_PERIOD_* thresholds."""
         nd = notice_period_days
         if nd <= config.NOTICE_PERIOD_IDEAL_MAX:
             return 1.0
@@ -139,17 +122,12 @@ class BehavioralScorer:
 
     @staticmethod
     def _github_score(s: RedrobSignals) -> float:
-        """-1 (not linked) → neutral default; otherwise score/100."""
         if not s.has_github:
             return config.GITHUB_NOT_LINKED_DEFAULT
         return float(s.github_activity_score) / 100.0
 
     @staticmethod
     def _uncertainty_penalty(signal_count: int) -> float:
-        """
-        Linear interpolation: 0 signals -> UNCERTAINTY_PENALTY_FLOOR,
-        >= MIN_SIGNAL_TYPES_FOR_FULL_CONFIDENCE signals -> 1.0.
-        """
         floor = config.UNCERTAINTY_PENALTY_FLOOR
         ratio = min(signal_count / config.MIN_SIGNAL_TYPES_FOR_FULL_CONFIDENCE, 1.0)
         return floor + (1.0 - floor) * ratio

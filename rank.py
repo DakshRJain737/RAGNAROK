@@ -1,15 +1,3 @@
-"""
-rank.py — RAGnarok CLI entry point.
-
-Runs the full ranking pipeline directly (no FastAPI) and writes submission.csv.
-
-Usage:
-    python rank.py [--input data/candidates.jsonl.gz] [--top-k 100] [--output output/submission.csv]
-
-This is equivalent to POST /rank → POST /export/csv via the API, but runs
-all pipeline modules in-process for offline / CI use.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -134,7 +122,6 @@ def _load_candidates(input_path: Path) -> list:
 
 
 def _load_jd(jd_path: Path | None):
-    """Load JD intent — from file if given, otherwise from pre-parsed JSON."""
     from pipeline.jd_parser import JDParser
     jd_parser = JDParser()
     if jd_path and jd_path.exists():
@@ -145,7 +132,6 @@ def _load_jd(jd_path: Path | None):
 
 
 def _write_csv(ranked: list, output_path: Path) -> None:
-    """Write ranked candidates to submission.csv."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["candidate_id", "rank", "score", "reasoning"])
@@ -161,7 +147,6 @@ def _write_csv(ranked: list, output_path: Path) -> None:
 
 
 def _validate_submission(output_path: Path, top_k: int) -> bool:
-    """Basic submission validation: row count, monotonic scores, rank range."""
     import re
     ok = True
     with open(output_path, newline="", encoding="utf-8") as f:
