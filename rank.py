@@ -140,7 +140,7 @@ def _write_csv(ranked: list, output_path: Path) -> None:
             writer.writerow({
                 "candidate_id": rc.candidate_id,
                 "rank": rc.rank,
-                "score": f"{rc.final_score:.6f}",
+                "score": f"{round(rc.final_score, 3)}",
                 "reasoning": rc.reasoning or "",
             })
     logger.info("Wrote %d rows to %s", len(ranked), output_path)
