@@ -4,6 +4,7 @@ import logging
 import math
 import multiprocessing as mp
 import os
+import re
 import time
 from itertools import islice
 from typing import Optional
@@ -39,18 +40,39 @@ _BANNED_OPENERS: tuple[str, ...] = (
     "The key strength is the candidate",
 )
 
+# Phrases that indicate circular reasoning — if output contains any of these,
+# fall back to template reasoning instead.
+_CIRCULAR_PHRASES: tuple[str, ...] = (
+    "composite score",
+    "top-5",
+    "top-10",
+    "top-15",
+    "top 5",
+    "top 10",
+    "top 15",
+    "top-ranked",
+    "ranking of",
+    "ranked #",
+    "score of 0.",
+    "score of 1.",
+)
+
 _SYSTEM_PROMPT = (
     "Recruiter brief: 2 sentences, facts only, \u226460 words total. "
     "S1: strongest single signal for this candidate — name exact skill, company, or number. "
     "S2: key counterpoint or condition that would change this assessment. "
     "Do NOT start with banned phrases like 'The strongest signal'. "
-    "Start directly with the fact (e.g. '82% skill match\u2026' or 'Inactive 120 days\u2026')."
+    "Start directly with the fact (e.g. '82% skill match\u2026' or 'Inactive 120 days\u2026'). "
+    "NEVER mention the candidate's rank number, composite score, or that they are 'top-N'. "
+    "Ground every claim in profile fields: years of experience, specific skill names, "
+    "company names, notice period, or inactivity days."
 )
 
 _USER_TEMPLATE = """\
 Job: Senior AI Eng | 5-9yr | product-co | retrieval/ranking skills
-Rank #{rank} of 100 | {tier} | {verdict} ({confidence}% confidence)
-Candidate: {yoe}yr exp | composite score {composite:.3f}
+Verdict: {verdict} ({confidence}% confidence)
+Candidate: {yoe}yr exp | notice {notice_days}d | inactive {inactivity_days}d
+Top skills: {top_skills}
 Facts:
 {signal_block}
 Brief:"""
@@ -64,6 +86,115 @@ def _smart_truncate(value: str, max_len: int) -> str:
     if last_comma >= max_len // 2:
         return sliced[:last_comma] + "…"
     return sliced + "…"
+
+
+def _truncate_at_sentence_end(text: str, max_len: int = 300) -> str:
+    """Truncate text at the last complete sentence boundary within max_len.
+
+    Finds the last sentence-ending punctuation (. ! ?) followed by a space or
+    end-of-string, and cuts there.  If no sentence boundary is found in the
+    second half of the text, falls back to the last comma or space boundary.
+    Always ends with a clean period — never with a partial word.
+    """
+    if len(text) <= max_len:
+        return text
+
+    window = text[:max_len]
+
+    # Look for last sentence-ending punctuation followed by space or EOS.
+    for i in range(len(window) - 1, max_len // 3, -1):
+        if window[i] in '.!?' and (i + 1 >= len(window) or window[i + 1] == ' '):
+            return window[:i + 1].strip()
+
+    # Fallback: cut at last comma boundary.
+    last_comma = window.rfind(", ")
+    if last_comma > max_len // 2:
+        return window[:last_comma].rstrip() + "."
+
+    # Last resort: cut at last space to avoid mid-word.
+    last_space = window.rfind(" ")
+    if last_space > max_len // 2:
+        return window[:last_space].rstrip().rstrip(".,;:") + "."
+
+    return window.rstrip().rstrip(".,;:") + "."
+
+
+def _ensure_ends_with_period(text: str) -> str:
+    """Guarantee the reasoning string ends with a sentence-terminating period.
+
+    Strips trailing commas, semicolons, dashes, and whitespace before adding
+    a period if the text doesn't already end with '.', '!', or '?'.
+    This is the last-resort safety net applied to every LLM and template output.
+    """
+    text = text.rstrip()
+    if not text:
+        return text
+    # Strip trailing incomplete-list punctuation.
+    while text and text[-1] in ',;:-':
+        text = text[:-1].rstrip()
+    if text and text[-1] not in '.!?':
+        text += '.'
+    return text
+
+
+def _sanitize_llm_output(text: str) -> str:
+    """Sanitize LLM output to uniform inline format.
+
+    Strips markdown bold, bullet dashes, bracketed tags like [HIGH],
+    multi-line breaks, and raw 'Candidate:' preamble lines.
+    Normalises STRENGTHS/RISKS/KEY CONDITION into inline headers.
+    """
+    # Strip 'Candidate: Xyr exp | composite score ...' preamble lines.
+    text = re.sub(r'^Candidate:[^\n]*\n?', '', text, flags=re.MULTILINE).strip()
+
+    # Strip markdown bold markers.
+    text = text.replace('**', '').replace('__', '')
+
+    # Strip bracketed confidence/severity tags: [HIGH], [MOD ], [MEDIUM], [LOW]
+    text = re.sub(r'\[(?:HIGH|MOD\s*|MODERATE|MEDIUM|LOW)\]\s*', '', text)
+
+    # Replace bullet-style dashes/dots at line starts with semicolons.
+    text = re.sub(r'\n\s*[-•–]\s+', '; ', text)
+
+    # Collapse multi-line into single line — newlines become '. ' or '; '.
+    # If a line ends with ':' (a header), use space; otherwise use '. '.
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if len(lines) > 1:
+        parts = []
+        for line in lines:
+            if parts and parts[-1].endswith(':'):
+                parts[-1] = parts[-1] + ' ' + line
+            elif parts:
+                # Join with '. ' if previous part doesn't end with punctuation.
+                prev = parts[-1]
+                if prev and prev[-1] in '.!?;:':
+                    parts.append(line)
+                else:
+                    parts.append(line)
+                parts[-2] = parts[-2].rstrip() + '. '
+            else:
+                parts.append(line)
+        text = ''.join(parts)
+
+    # Normalise header labels: ensure colon after STRENGTHS/RISKS/KEY CONDITION.
+    text = re.sub(r'\bSTRENGTHS\s*:?\s*', 'STRENGTHS: ', text)
+    text = re.sub(r'\bRISKS\s*:?\s*', 'RISKS: ', text)
+    text = re.sub(r'\bKEY CONDITION\s*:?\s*', 'KEY CONDITION: ', text)
+    text = re.sub(r'\bCONTESTED\s*:?\s*', 'CONTESTED: ', text)
+
+    # Collapse multiple spaces.
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+
+    # Collapse duplicate section headers that appear from joining.
+    text = re.sub(r'(STRENGTHS: )\1+', r'\1', text)
+    text = re.sub(r'(RISKS: )\1+', r'\1', text)
+    text = re.sub(r'(KEY CONDITION: )\1+', r'\1', text)
+
+    # Clean up ': ;' and ': . ' artifacts from bullet conversion + header normalisation.
+    text = re.sub(r':\s*;\s*', ': ', text)
+    text = re.sub(r':\s*\.\s*', ': ', text)
+
+    return text
 
 
 def _build_signal_block(trust: TrustVerdict) -> str:
@@ -116,15 +247,26 @@ def _build_messages(
     composite_score: float,
 ) -> list[dict]:
     signal_block = _build_signal_block(trust)
-    tier = _tier_label(rank)
     yoe = f"{candidate.years_of_experience:.1f}" if candidate else "?"
+
+    # Extract grounding fields for the prompt so the LLM cites real data.
+    notice_days = "?"
+    inactivity_days = "?"
+    top_skills = "(unknown)"
+    if candidate:
+        notice_days = str(getattr(candidate.signals, 'notice_period_days', '?'))
+        inactivity_days = str(getattr(candidate.signals, 'days_since_active', '?'))
+        # Top 3 skill names from the candidate's profile for grounding.
+        skill_names = [s.name_raw for s in candidate.skills[:10]]
+        top_skills = ", ".join(skill_names[:5]) if skill_names else "(none listed)"
+
     prompt = _USER_TEMPLATE.format(
-        rank=rank,
-        tier=tier,
         verdict=trust.verdict,
         confidence=int(round(trust.confidence_pct)),
         yoe=yoe,
-        composite=composite_score,
+        notice_days=notice_days,
+        inactivity_days=inactivity_days,
+        top_skills=top_skills,
         signal_block=signal_block,
     )
     return [
@@ -169,8 +311,8 @@ def _pool_infer(task: tuple) -> tuple[str, str]:
     try:
         out = _worker_llm.create_chat_completion(
             messages=messages,
-            temperature=0.3,
-            max_tokens=80,
+            temperature=0.2,
+            max_tokens=85,
             stop=["\n\n", "Sentence 3", "3.", "\nJob:"],
         )
         text = out["choices"][0]["message"]["content"].strip()
@@ -182,7 +324,25 @@ def _pool_infer(task: tuple) -> tuple[str, str]:
                 )
             return cid, fallback
 
-        return cid, text[:320]
+        # Fix 2: Reject circular reasoning — if output parrots score/rank, use fallback.
+        text_lower = text.lower()
+        if any(phrase in text_lower for phrase in _CIRCULAR_PHRASES):
+            if _worker_logger:
+                _worker_logger.debug(
+                    "Worker: output rejected (circular reasoning): %r", text[:80]
+                )
+            return cid, fallback
+
+        # Fix 4: Sanitize LLM output — strip markdown, bullets, multi-line.
+        text = _sanitize_llm_output(text)
+
+        # Fix 1: Truncate at sentence boundary — never end mid-word.
+        text = _truncate_at_sentence_end(text, 300)
+
+        # Final guarantee: always end with a period.
+        text = _ensure_ends_with_period(text)
+
+        return cid, text
 
     except Exception as exc:
         if _worker_logger:

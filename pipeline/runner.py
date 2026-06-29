@@ -399,6 +399,77 @@ class PipelineRunner:
             logger.warning("LLM justification unavailable, using rule-based reasoning: %s", e)
         timings["llm_justification"] = (time.perf_counter() - t0) * 1000
 
+        # ── 8b. Final format sanitisation pass (Fix 4) ────────────────────────
+        # Ensure every reasoning string (LLM or template) has uniform format:
+        # no markdown bold, no bullets, no multi-line, no mid-word truncation.
+        import re as _re
+
+        def _sanitize_reasoning_format(text: str) -> str:
+            """Sanitize any reasoning string to uniform single-line format."""
+            # Strip markdown bold.
+            text = text.replace('**', '').replace('__', '')
+            # Strip bracketed confidence/severity tags.
+            text = _re.sub(r'\[(?:HIGH|MOD\s*|MODERATE|MEDIUM|LOW)\]\s*', '', text)
+            # Replace bullet-style dashes at line starts.
+            text = _re.sub(r'\n\s*[-•–]\s+', '; ', text)
+            # Collapse multi-line: join lines smartly.
+            lines = [l.strip() for l in text.split('\n') if l.strip()]
+            if len(lines) > 1:
+                parts = []
+                for line in lines:
+                    if parts and parts[-1].endswith(':'):
+                        parts[-1] = parts[-1] + ' ' + line
+                    elif parts:
+                        prev = parts[-1]
+                        if prev and prev[-1] in '.!?;:':
+                            parts.append(line)
+                        else:
+                            parts.append(line)
+                        parts[-2] = parts[-2].rstrip() + '. '
+                    else:
+                        parts.append(line)
+                text = ''.join(parts)
+            # Normalise section headers.
+            text = _re.sub(r'\bSTRENGTHS\s*:?\s*', 'STRENGTHS: ', text)
+            text = _re.sub(r'\bRISKS\s*:?\s*', 'RISKS: ', text)
+            text = _re.sub(r'\bKEY CONDITION\s*:?\s*', 'KEY CONDITION: ', text)
+            text = _re.sub(r'\bCONTESTED\s*:?\s*', 'CONTESTED: ', text)
+            # Collapse duplicate headers and multi-spaces.
+            text = _re.sub(r'(STRENGTHS: )\1+', r'\1', text)
+            text = _re.sub(r'(RISKS: )\1+', r'\1', text)
+            text = _re.sub(r'(KEY CONDITION: )\1+', r'\1', text)
+            text = _re.sub(r'\s{2,}', ' ', text).strip()
+            # Clean up ': ;' and ': . ' artifacts from bullet conversion + header normalisation.
+            text = _re.sub(r':\s*;\s*', ': ', text)
+            text = _re.sub(r':\s*\.\s*', ': ', text)
+            # Strip 'Candidate:' preamble.
+            text = _re.sub(r'^Candidate:[^\n]*\n?', '', text, flags=_re.MULTILINE).strip()
+            # Sentence-end truncation safety net (never end mid-word).
+            max_len = 320
+            if len(text) > max_len:
+                window = text[:max_len]
+                for i in range(len(window) - 1, max_len // 3, -1):
+                    if window[i] in '.!?' and (i + 1 >= len(window) or window[i + 1] == ' '):
+                        text = window[:i + 1].strip()
+                        break
+                else:
+                    last_space = window.rfind(' ')
+                    if last_space > max_len // 2:
+                        text = window[:last_space].rstrip().rstrip('.,;:') + '.'
+                    else:
+                        text = window.rstrip().rstrip('.,;:') + '.'
+            # Final guarantee: every reasoning string ends with a period.
+            text = text.rstrip()
+            while text and text[-1] in ',;:-':
+                text = text[:-1].rstrip()
+            if text and text[-1] not in '.!?':
+                text += '.'
+            return text
+
+        for cid in list(reasonings):
+            reasonings[cid] = _sanitize_reasoning_format(reasonings[cid])
+        logger.info("Reasoning: format sanitisation complete for %d candidates.", len(reasonings))
+
         # ── 9. Assemble RankedCandidate list ──────────────────────────────
         t0 = time.perf_counter()
         ranked: list[RankedCandidate] = []

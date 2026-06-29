@@ -385,6 +385,94 @@ def _sentence1_weak(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FIX 3: MINIMUM FIELD ENRICHMENT FOR TOP-30
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_skill_names_from_text(text: str) -> list[str]:
+    """Extract recognisable skill/tool names already present in text.
+
+    Returns a lowercase list of known ML/AI skill tokens found in the text.
+    Used to check whether sentence 1 already names enough specific skills.
+    """
+    # Common skills we look for — just enough to count specificity.
+    _KNOWN_SKILLS = {
+        "faiss", "elasticsearch", "opensearch", "milvus", "qdrant", "pinecone",
+        "weaviate", "pgvector", "bm25", "langchain", "haystack", "pytorch",
+        "tensorflow", "keras", "scikit-learn", "xgboost", "lightgbm",
+        "mlflow", "mlops", "bentoml", "kubeflow", "airflow", "kafka",
+        "docker", "kubernetes", "pyspark", "embeddings", "rag", "lora",
+        "qlora", "peft", "bge", "e5", "sentence transformers",
+        "hugging face transformers", "llamaindex", "semantic search",
+        "vector search", "deep learning", "machine learning",
+        "information retrieval", "prompt engineering", "python",
+        "weights & biases", "data pipelines", "sql", "etl",
+    }
+    text_lower = text.lower()
+    return [s for s in _KNOWN_SKILLS if s in text_lower]
+
+
+def _enrich_with_specifics(
+    s1: str,
+    trust: TrustVerdict,
+    candidate: CandidateFeatureVector,
+    scores: ComponentScores,
+    min_skills: int = 3,
+    require_risk: bool = True,
+) -> str:
+    """Enrich sentence 1 to ensure minimum specificity for top-30 candidates.
+
+    Ensures at least `min_skills` specific skill names appear and at least
+    1 risk factor (inactivity days, notice period, or skill gap) is mentioned.
+    Appends missing information inline without restructuring the sentence.
+    """
+    existing_skills = _extract_skill_names_from_text(s1)
+    additions: list[str] = []
+
+    # If not enough skill names, pull from candidate profile.
+    if len(existing_skills) < min_skills:
+        needed = min_skills - len(existing_skills)
+        candidate_skills = [s.name_raw for s in candidate.skills]
+        existing_lower = {s.lower() for s in existing_skills}
+        extra = []
+        for sk in candidate_skills:
+            if sk.lower() not in existing_lower:
+                extra.append(sk)
+                existing_lower.add(sk.lower())
+                if len(extra) >= needed:
+                    break
+        if extra:
+            additions.append(f"key skills: {', '.join(extra)}")
+
+    # If no risk factor mentioned, add the most relevant one.
+    if require_risk:
+        risk_keywords = ["inactive", "inactivity", "notice", "gap", "missing",
+                         "partial", "below", "weak", "risk", "concern"]
+        has_risk = any(kw in s1.lower() for kw in risk_keywords)
+        if not has_risk:
+            inactivity = getattr(candidate.signals, 'days_since_active', 0)
+            notice = getattr(candidate.signals, 'notice_period_days', 0)
+            if inactivity > 30:
+                additions.append(f"{inactivity}d inactive")
+            elif notice > 60:
+                additions.append(f"{notice}d notice period")
+            elif scores.required_skill_coverage < 0.60:
+                pct = f"{scores.required_skill_coverage:.0%}"
+                additions.append(f"{pct} required skill coverage")
+            else:
+                # Generic mild risk note.
+                additions.append("verify current engagement")
+
+    if not additions:
+        return s1
+
+    # Append inline, separated by semicolons.
+    suffix = "; ".join(additions)
+    # Clean trailing punctuation from s1 before appending.
+    s1_clean = _TRAIL_PUNCT_RE.sub("", s1).strip()
+    return f"{s1_clean}; {suffix}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SENTENCE 2 BUILDER (trust sentence — same for all tiers, varies by verdict)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -453,6 +541,34 @@ def _sentence2_trust(
 # ASSEMBLY + LENGTH GUARD
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _truncate_at_sentence_end(text: str, max_len: int) -> str:
+    """Truncate text at the last complete sentence boundary within max_len.
+
+    Always ends with a clean period — never with a partial word or ellipsis.
+    """
+    if len(text) <= max_len:
+        return text
+
+    window = text[:max_len]
+
+    # Look for last sentence-ending punctuation followed by space or EOS.
+    for i in range(len(window) - 1, max_len // 3, -1):
+        if window[i] in '.!?' and (i + 1 >= len(window) or window[i + 1] == ' '):
+            return window[:i + 1].strip()
+
+    # Fallback: cut at last comma boundary.
+    last_comma = window.rfind(", ")
+    if last_comma > max_len // 2:
+        return window[:last_comma].rstrip() + "."
+
+    # Last resort: cut at last space to avoid mid-word.
+    last_space = window.rfind(" ")
+    if last_space > max_len // 2:
+        return window[:last_space].rstrip().rstrip(".,;:") + "."
+
+    return window.rstrip().rstrip(".,;:") + "."
+
+
 def _assemble(sentence1: str, sentence2: str) -> str:
     """
     Join two sentences, clean trailing punctuation, enforce length limits.
@@ -464,6 +580,8 @@ def _assemble(sentence1: str, sentence2: str) -> str:
       the minimal trust string "{VERDICT} — {conf}% confidence."
     - Total ≥ _MIN_CHARS.  If under (very sparse profile), pad with a
       fallback phrase.
+    - Final safety net: sentence-end truncation ensures output never ends
+      mid-word.
     """
     # Normalise sentence 1.
     s1 = _TRAIL_PUNCT_RE.sub("", sentence1).strip()
@@ -496,14 +614,17 @@ def _assemble(sentence1: str, sentence2: str) -> str:
             trunc = s1[:budget]
             last_comma = trunc.rfind(", ")
             if last_comma > budget // 2:
-                s1 = trunc[:last_comma] + "…"
+                s1 = trunc[:last_comma] + "."
             else:
-                s1 = trunc.rstrip() + "…"
-            combined = f"{s1}. {s2}."
+                s1 = trunc.rstrip().rstrip(".,;:") + "."
+            combined = f"{s1} {s2}."
 
     # Minimum length guard: if too short, it's likely a sparse profile.
     if len(combined) < _MIN_CHARS:
         combined = combined.rstrip(".") + " — verify via interview."
+
+    # Final safety net: ensure output never ends mid-word (Fix 1).
+    combined = _truncate_at_sentence_end(combined, _MAX_CHARS)
 
     return combined
 
@@ -616,6 +737,14 @@ def generate_reasoning(
         s1 = _sentence1_mid(trust, candidate, scores)
     else:
         s1 = _sentence1_weak(trust, candidate, scores)
+
+    # ── Fix 3: Enrich with specifics for top-30 candidates ────────────────────
+    # Ensure ≥3 skill names + ≥1 risk factor for ELITE and STRONG tiers.
+    if tier in ("ELITE", "STRONG") and not is_disqualified:
+        s1 = _enrich_with_specifics(
+            s1, trust, candidate, scores,
+            min_skills=3, require_risk=True,
+        )
 
     # ── Build Sentence 2 (trust classification) ───────────────────────────────
     # Compute the remaining character budget for Sentence 2.
