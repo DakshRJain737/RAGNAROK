@@ -1,9 +1,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # RAGnarok — Candidate Ranking System
-# Base image: Python 3.10 slim (CPU-only, no GPU needed)
+# Base image: Python 3.11-slim — matches local venv (Python 3.11.2)
+# CPU-only, no GPU needed
 # ─────────────────────────────────────────────────────────────────────────────
 
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
