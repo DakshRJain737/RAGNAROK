@@ -87,7 +87,7 @@ LLM_WEIGHT: float = 0.3
 # LLM justification: only generate LLM briefs for this many top candidates.
 # Candidates ranked below this threshold keep the rule-based reasoning_generator
 # output (which is already signal-grounded and high quality).
-LLM_RERANKER_TOP_N: int = 55
+LLM_RERANKER_TOP_N: int = 60
 
 # Final submission size (spec requirement).
 SUBMISSION_TOP_K: int = 100
