@@ -558,7 +558,6 @@ Expected: strong AI/ML candidate at a product company scores ~0.7–0.9, consult
 | `runner_llm_patch.py` | Exact diff showing where to insert LLM block in `runner.py` |
 | `precompute_llm_addition.py` | `download_llm_model()` to add to `precompute.py` |
 | `test_llm_reranker.py` | Standalone smoke test with mock schemas |
-| `Dockerfile` | Full container build with LLM support |
 
 ### Tuning
 

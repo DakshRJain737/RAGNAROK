@@ -6,7 +6,6 @@ Here is the visual directory tree for the core repository (excluding setup/autom
 RAGnarok/
 ├── .gitignore
 ├── Daily_Task(sprint planner).html
-├── Dockerfile
 ├── LICENSE
 ├── Optimised_Pipeline.html
 ├── README.md
