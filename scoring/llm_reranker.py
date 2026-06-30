@@ -137,6 +137,38 @@ def _ensure_ends_with_period(text: str) -> str:
     return text
 
 
+def _has_repetition_loop(text: str, min_phrase_words: int = 8) -> bool:
+    """Detect whether the LLM fell into a true repetition loop.
+
+    Splits the text into overlapping n-grams of `min_phrase_words` words and
+    checks if any non-structural n-gram appears more than once.
+
+    Uses min_phrase_words=8 (not 5) to avoid false positives on structural
+    template fragments like "score across 100% of capabilities" that legitimately
+    repeat across different cluster descriptions.
+    """
+    # Structural phrase fragments that legitimately repeat in template output.
+    _STRUCTURAL = (
+        "score across 100% of capabilities",
+        "score across 75% of capabilities",
+        "score across 67% of capabilities",
+        "across 100% of capabilities",
+        "across 75% of capabilities",
+    )
+    words = re.split(r'\s+', text.strip())
+    if len(words) < min_phrase_words * 2:
+        return False
+    seen: set[str] = set()
+    for i in range(len(words) - min_phrase_words + 1):
+        phrase = ' '.join(words[i:i + min_phrase_words]).lower()
+        if any(s in phrase for s in _STRUCTURAL):
+            continue
+        if phrase in seen:
+            return True
+        seen.add(phrase)
+    return False
+
+
 def _sanitize_llm_output(text: str) -> str:
     """Sanitize LLM output to uniform inline format.
 
@@ -311,8 +343,9 @@ def _pool_infer(task: tuple) -> tuple[str, str]:
     try:
         out = _worker_llm.create_chat_completion(
             messages=messages,
-            temperature=0.2,
-            max_tokens=85,
+            temperature=0.3,
+            max_tokens=90,
+            repeat_penalty=1.15,   # suppress repetition loops in small models
             stop=["\n\n", "Sentence 3", "3.", "\nJob:"],
         )
         text = out["choices"][0]["message"]["content"].strip()
@@ -330,6 +363,14 @@ def _pool_infer(task: tuple) -> tuple[str, str]:
             if _worker_logger:
                 _worker_logger.debug(
                     "Worker: output rejected (circular reasoning): %r", text[:80]
+                )
+            return cid, fallback
+
+        # Detect repetition loop — fall back to template if the LLM repeated itself.
+        if _has_repetition_loop(text):
+            if _worker_logger:
+                _worker_logger.debug(
+                    "Worker: output rejected (repetition loop): %r", text[:120]
                 )
             return cid, fallback
 
